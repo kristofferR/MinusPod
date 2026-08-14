@@ -228,9 +228,8 @@ class MaintenanceMixin:
         for dup in duplicates:
             all_ids = [int(x) for x in dup['all_ids'].split(',')]
 
-            # Find the pattern to keep. Active outranks disabled, or a row the
-            # operator switched off would delete the live one and take its stats;
-            # then tier, so a user/community pattern never loses to an auto one.
+            # Find the pattern to keep. Active first, or a switched-off row would
+            # delete the live one and take its stats; then tier, then confirmations.
             patterns_cursor = conn.execute(
                 f'''SELECT ap.id, ap.sponsor_id, ks.name AS sponsor,
                           ap.confirmation_count, ap.false_positive_count,
@@ -293,8 +292,7 @@ class MaintenanceMixin:
                 group_ids
             )}
             # Only onto an active keeper: fingerprint matching ignores is_active,
-            # so promoting onto a disabled row would keep cutting audio the
-            # operator switched off.
+            # so a disabled row would keep cutting audio the operator switched off.
             donor = next((pid for pid in remove_ids if pid in fingerprinted), None)
             if (donor is not None and keep_id not in fingerprinted
                     and keep_pattern['is_active']):
