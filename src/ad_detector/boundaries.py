@@ -26,6 +26,7 @@ from config import (
     MIN_KEYWORD_LENGTH, MIN_UNCOVERED_TAIL_DURATION,
     TERMINAL_SNAP_EOF_TOLERANCE_SECONDS,
     DEFAULT_SEGMENT_ACTION, normalize_segment_category,
+    MIN_AD_DURATION_FOR_REMOVAL,
     PATTERN_TIGHTEN_MIN_EXCESS_SECONDS, PATTERN_TIGHTEN_MIN_CONFIDENCE,
 )
 
@@ -1108,6 +1109,13 @@ def split_conflicting_action_span(last: Dict, current: Dict,
     if current['start'] >= last['end']:
         return last, [current.copy()]
 
+    def mark_trusted_fragment(fragment, parent):
+        if (parent.get('_trusted_split_fragment')
+                or parent['end'] - parent['start']
+                >= MIN_AD_DURATION_FOR_REMOVAL):
+            fragment['_trusted_split_fragment'] = True
+        return fragment
+
     priority = {'remove': 0, 'beep': 1, 'keep': 2}
     if ((last_action is None or current_action is None)
             and current['end'] > last['end']):
@@ -1118,6 +1126,7 @@ def split_conflicting_action_span(last: Dict, current: Dict,
                     'merged_protected_end'):
             clamped.pop(key, None)
         clamped['start'] = last['end']
+        mark_trusted_fragment(clamped, current)
         return last, [clamped]
     current_wins = (
         last_action is None
@@ -1132,6 +1141,7 @@ def split_conflicting_action_span(last: Dict, current: Dict,
                     'merged_protected_end'):
             after.pop(key, None)
         after['start'] = last['end']
+        mark_trusted_fragment(after, current)
         return last, [after]
 
     if current['end'] <= last['end']:
@@ -1148,6 +1158,8 @@ def split_conflicting_action_span(last: Dict, current: Dict,
         after = dict(before)
         after['start'] = current['end']
         after['end'] = last['end']
+        mark_trusted_fragment(before, last)
+        mark_trusted_fragment(after, last)
         new_last = before if before['start'] < before['end'] else None
         entries = [current.copy()]
         if after['start'] < after['end']:
@@ -1159,6 +1171,7 @@ def split_conflicting_action_span(last: Dict, current: Dict,
                 'merged_protected_end'):
         shortened_last.pop(key, None)
     shortened_last['end'] = current['start']
+    mark_trusted_fragment(shortened_last, last)
     if shortened_last['end'] <= shortened_last['start']:
         shortened_last = None
     return shortened_last, [current.copy()]
