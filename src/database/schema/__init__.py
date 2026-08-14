@@ -2963,7 +2963,9 @@ class SchemaMixin:
         are archived to `_orphaned_audio_fingerprints` rather than dropped. The
         rebuild aborts and retries next startup if the copy loses a row.
         """
-        if any(fk['table'] == 'ad_patterns' for fk in
+        # Databases from v0.1.107 already carry this constraint; v0.1.108 dropped
+        # it from the DDL, which never rebuilds a table that already exists.
+        if any(fk['table'] == 'ad_patterns' and fk['on_delete'] == 'CASCADE' for fk in
                conn.execute("PRAGMA foreign_key_list(audio_fingerprints)").fetchall()):
             return
 

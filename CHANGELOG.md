@@ -41,7 +41,10 @@ release notes.
   startup by rebuilding the table. Fingerprints whose pattern is already gone
   cannot satisfy the constraint, so the migration copies them to
   `_orphaned_audio_fingerprints` instead of deleting them, and aborts before the
-  destructive step if the row count does not match.
+  destructive step if the row count does not match. Databases created around
+  v0.1.107 already carry this constraint, since v0.1.108 dropped it from the
+  schema without rebuilding tables that already existed; those are detected and
+  left alone.
 
 ## [2.88.1] - 2026-08-13
 

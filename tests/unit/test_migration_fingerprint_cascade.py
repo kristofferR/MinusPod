@@ -123,3 +123,46 @@ def test_migration_is_idempotent(db):
 
     assert _has_fk(conn)
     assert conn.execute("SELECT COUNT(*) FROM audio_fingerprints").fetchone()[0] == 1
+
+
+def test_an_existing_cascading_fk_is_left_alone(db):
+    """Databases born at v0.1.107 already have this constraint."""
+    conn = db.get_connection()
+    pattern_id = _add_pattern(conn)
+    _add_fingerprint(conn, pattern_id, b'already-fine')
+
+    db._migrate_fingerprint_cascade(conn)
+
+    assert _has_fk(conn)
+    assert conn.execute("SELECT COUNT(*) FROM audio_fingerprints").fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = "
+        "'_orphaned_audio_fingerprints'").fetchone()[0] == 0
+
+
+def test_a_non_cascading_fk_is_rebuilt(db):
+    """A REFERENCES without ON DELETE CASCADE does not satisfy the gate."""
+    conn = db.get_connection()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    conn.execute("DROP TABLE IF EXISTS audio_fingerprints")
+    conn.execute("""
+        CREATE TABLE audio_fingerprints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern_id INTEGER UNIQUE REFERENCES ad_patterns(id),
+            fingerprint BLOB,
+            duration REAL,
+            created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        )
+    """)
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = ON")
+    pattern_id = _add_pattern(conn)
+    _add_fingerprint(conn, pattern_id, b'needs-cascade')
+
+    db._migrate_fingerprint_cascade(conn)
+
+    assert any(fk['on_delete'] == 'CASCADE' for fk in
+               conn.execute("PRAGMA foreign_key_list(audio_fingerprints)").fetchall())
+    conn.execute("DELETE FROM ad_patterns WHERE id = ?", (pattern_id,))
+    conn.commit()
+    assert conn.execute("SELECT COUNT(*) FROM audio_fingerprints").fetchone()[0] == 0
