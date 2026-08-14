@@ -192,3 +192,4 @@ smoke/results/*
 !smoke/results/.gitkeep
 .superpowers/
 superpowers/
+.worktrees/
