@@ -1331,23 +1331,18 @@ def _partition_pass2_category_actions(processed_ads, original_ads, actions_map):
             kept_processed, kept_original)
 
 
-def _exclude_category_kept_spans(processed_ads, original_ads,
-                                  kept_processed, pass1_cuts):
-    """Subtract category-kept pass-2 spans from the remaining candidates.
-
-    Heuristic roll detection can overlap an LLM marker whose category action
-    is keep. Split the candidate on the processed timeline, then remap each
-    surviving fragment to original coordinates so validation, recutting, and
-    the UI retain paired markers without cutting through the kept audio.
-    """
-    if not kept_processed:
+def _split_pass2_candidates_around_spans(processed_ads, original_ads,
+                                          barriers_processed, pass1_cuts,
+                                          barrier_label):
+    """Split paired pass-2 candidates around protected processed spans."""
+    if not barriers_processed:
         return processed_ads, original_ads
     if len(processed_ads) != len(original_ads):
         raise ValueError(
             'Pass-2 processed/original marker lists must stay paired')
 
     barriers = sorted(
-        ((marker['start'], marker['end']) for marker in kept_processed),
+        ((marker['start'], marker['end']) for marker in barriers_processed),
         key=lambda span: span[0],
     )
     timestamp_map = _build_timestamp_map(pass1_cuts)
@@ -1376,7 +1371,7 @@ def _exclude_category_kept_spans(processed_ads, original_ads,
 
         audio_logger.info(
             f"Pass-2 candidate {processed['start']:.1f}s-"
-            f"{processed['end']:.1f}s split around category-kept audio into "
+            f"{processed['end']:.1f}s split around {barrier_label} into "
             f"{len(fragments)} removable fragment(s)")
         for start, end in fragments:
             fragment_processed = dict(processed, start=start, end=end)
@@ -1391,6 +1386,20 @@ def _exclude_category_kept_spans(processed_ads, original_ads,
             surviving_original.append(fragment_original)
 
     return surviving_processed, surviving_original
+
+
+def _exclude_category_kept_spans(processed_ads, original_ads,
+                                  kept_processed, pass1_cuts):
+    """Subtract category-kept pass-2 spans from remaining candidates.
+
+    Heuristic roll detection can overlap an LLM marker whose category action
+    is keep. Split the candidate on the processed timeline, then remap each
+    surviving fragment to original coordinates so validation, recutting, and
+    the UI retain paired markers without cutting through the kept audio.
+    """
+    return _split_pass2_candidates_around_spans(
+        processed_ads, original_ads, kept_processed, pass1_cuts,
+        'category-kept audio')
 
 
 def _pass2_keep_barriers_processed(pass1_kept_markers, pass1_cuts,
@@ -1423,6 +1432,47 @@ def _stamp_pass2_cut_actions(processed_cuts, original_cuts, actions_map):
         if action not in ('remove', 'beep'):
             action = DEFAULT_SEGMENT_ACTION
         marker['action_applied'] = action
+
+
+def _reconcile_pass2_cut_actions(processed_cuts, original_cuts, pass1_cuts):
+    """Make actual pass-2 cuts disjoint when their render actions differ.
+
+    A beep preserves timeline duration while remove shrinks it, so overlapping
+    spans cannot both reach ffmpeg. Beep is explicit protected replacement
+    intent: split remove candidates around the beep spans, then restore a
+    time-ordered paired list for recutting and UI persistence.
+    """
+    if len(processed_cuts) != len(original_cuts):
+        raise ValueError(
+            'Pass-2 processed/original cut lists must stay paired')
+
+    beep_pairs = [
+        (processed, original)
+        for processed, original in zip(processed_cuts, original_cuts)
+        if processed.get('action_applied') == 'beep'
+    ]
+    if not beep_pairs:
+        return processed_cuts, original_cuts
+    remove_pairs = [
+        (processed, original)
+        for processed, original in zip(processed_cuts, original_cuts)
+        if processed.get('action_applied') != 'beep'
+    ]
+    remove_processed, remove_original = (
+        [pair[0] for pair in remove_pairs],
+        [pair[1] for pair in remove_pairs],
+    )
+    remove_processed, remove_original = _split_pass2_candidates_around_spans(
+        remove_processed,
+        remove_original,
+        [pair[0] for pair in beep_pairs],
+        pass1_cuts,
+        'beep-replacement audio',
+    )
+    reconciled = [*beep_pairs, *zip(remove_processed, remove_original)]
+    reconciled.sort(key=lambda pair: pair[0]['start'])
+    return ([pair[0] for pair in reconciled],
+            [pair[1] for pair in reconciled])
 
 
 def _refine_and_validate(slug, episode_id, all_ads, segments, audio_path,
@@ -2544,6 +2594,10 @@ def _drop_uncovered_pass2_ads(slug, episode_id, v_ads_to_cut, v_ads_for_ui,
     """
     twin = {id(p): o for p, o in zip(verification_ads_processed,
                                      verification_ads_original)}
+    # Action reconciliation can replace a candidate with split copies after
+    # validation. Prefer the final cut/UI pairing so a short split fragment
+    # filtered by AudioProcessor also removes its exact UI marker.
+    twin.update({id(p): o for p, o in zip(v_ads_to_cut, v_ads_for_ui)})
     for ad in [a for a in v_ads_to_cut
                if not _covered_by_cuts(a, recut_applied, total_duration)]:
         v_ads_to_cut.remove(ad)
@@ -2757,6 +2811,8 @@ def _run_verification_pass(ctx, processed_path, pass1_cuts,
 
                 _stamp_pass2_cut_actions(
                     v_ads_to_cut, v_ads_for_ui, segment_actions)
+                v_ads_to_cut, v_ads_for_ui = _reconcile_pass2_cut_actions(
+                    v_ads_to_cut, v_ads_for_ui, pass1_cuts)
 
                 if v_ads_to_cut:
                     audio_logger.info(
