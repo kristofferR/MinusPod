@@ -1,4 +1,4 @@
-"""deduplicate_patterns must keep a user/community pattern over an auto one."""
+"""deduplicate_patterns tier ordering, and fingerprint retention across a merge."""
 import os
 import sys
 
@@ -61,3 +61,69 @@ def test_confirmation_count_still_breaks_ties_within_a_tier(db):
     assert remaining[0]['id'] == high_id
     assert conn.execute("SELECT COUNT(*) FROM ad_patterns WHERE id = ?",
                          (low_id,)).fetchone()[0] == 0
+
+
+def _add_fingerprint(db, pattern_id, blob, duration):
+    conn = db.get_connection()
+    conn.execute(
+        "INSERT INTO audio_fingerprints (pattern_id, fingerprint, duration) "
+        "VALUES (?, ?, ?)", (pattern_id, blob, duration),
+    )
+    conn.commit()
+
+
+def _fingerprints(db):
+    return db.get_connection().execute(
+        "SELECT pattern_id, fingerprint, duration FROM audio_fingerprints").fetchall()
+
+
+def test_keeper_without_a_fingerprint_inherits_one_from_a_duplicate(db):
+    user_id = _add_pattern(db, 'user', 10)
+    auto_id = _add_pattern(db, 'auto', 17)
+    _add_fingerprint(db, auto_id, b'chroma-auto', 12.5)
+
+    db.deduplicate_patterns()
+
+    rows = _fingerprints(db)
+    assert len(rows) == 1
+    assert rows[0]['pattern_id'] == user_id
+    assert rows[0]['fingerprint'] == b'chroma-auto'
+    assert rows[0]['duration'] == 12.5
+
+
+def test_keeper_with_a_fingerprint_does_not_take_a_duplicates(db):
+    user_id = _add_pattern(db, 'user', 10)
+    auto_id = _add_pattern(db, 'auto', 17)
+    _add_fingerprint(db, user_id, b'chroma-user', 9.0)
+    _add_fingerprint(db, auto_id, b'chroma-auto', 12.5)
+
+    db.deduplicate_patterns()
+
+    rows = _fingerprints(db)
+    assert len(rows) == 1
+    assert rows[0]['pattern_id'] == user_id
+    assert rows[0]['fingerprint'] == b'chroma-user'
+
+
+def test_only_the_best_ranked_duplicate_fingerprint_is_promoted(db):
+    user_id = _add_pattern(db, 'user', 10)
+    auto_high = _add_pattern(db, 'auto', 17)
+    auto_low = _add_pattern(db, 'auto', 3)
+    _add_fingerprint(db, auto_low, b'chroma-low', 4.0)
+    _add_fingerprint(db, auto_high, b'chroma-high', 12.5)
+
+    db.deduplicate_patterns()
+
+    rows = _fingerprints(db)
+    assert len(rows) == 1
+    assert rows[0]['pattern_id'] == user_id
+    assert rows[0]['fingerprint'] == b'chroma-high'
+
+
+def test_dedupe_without_any_fingerprints_is_a_noop_for_that_table(db):
+    _add_pattern(db, 'user', 10)
+    _add_pattern(db, 'auto', 17)
+
+    db.deduplicate_patterns()
+
+    assert _fingerprints(db) == []

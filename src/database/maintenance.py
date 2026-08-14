@@ -202,10 +202,12 @@ class MaintenanceMixin:
         return total_reset, total_freed_mb
 
     def deduplicate_patterns(self) -> int:
-        """Remove duplicate patterns, merging stats into the pattern with most confirmations.
+        """Remove duplicate patterns, merging stats into the highest-tier survivor.
 
         Duplicates are patterns with the same text_template and podcast_id,
-        regardless of sponsor (sponsor variations are merged together).
+        regardless of sponsor (sponsor variations are merged together). A
+        user or community pattern outranks an auto-learned one; confirmation
+        count only breaks ties within a tier.
 
         Returns count of duplicates removed."""
         conn = self.get_connection()
@@ -278,8 +280,24 @@ class MaintenanceMixin:
                 [keep_id] + remove_ids
             )
 
-            # Delete duplicate patterns' audio fingerprints (UNIQUE pattern_id,
-            # no cascade) so they don't orphan against the removed rows.
+            # Duplicates share a text_template, so a loser's fingerprint describes
+            # the keeper's audio too. Promote the best-ranked one when the keeper
+            # has none; only fresh audio can rebuild a lost hash.
+            fingerprinted = {row['pattern_id'] for row in conn.execute(
+                f'''SELECT pattern_id FROM audio_fingerprints
+                    WHERE pattern_id IN ({placeholders},?)''',
+                remove_ids + [keep_id]
+            )}
+            if keep_id not in fingerprinted:
+                donor = next((p['id'] for p in patterns[1:] if p['id'] in fingerprinted), None)
+                if donor is not None:
+                    conn.execute(
+                        'UPDATE audio_fingerprints SET pattern_id = ? WHERE pattern_id = ?',
+                        [keep_id, donor]
+                    )
+
+            # Delete the rest (UNIQUE pattern_id, no cascade) so they don't
+            # orphan against the removed rows.
             conn.execute(
                 f'DELETE FROM audio_fingerprints WHERE pattern_id IN ({placeholders})',
                 remove_ids
