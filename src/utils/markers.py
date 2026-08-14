@@ -1,4 +1,5 @@
 """Marker-dict bookkeeping shared by the detector, validator, and reviewer."""
+import math
 from typing import Dict, List, Optional, Tuple
 
 DAI_CORE_SPANS = 'dai_core_spans'
@@ -19,7 +20,7 @@ def _valid_dai_core_spans(marker: Dict) -> List[Dict[str, float]]:
             end = float(raw['end'])
         except (KeyError, TypeError, ValueError):
             continue
-        if end > start:
+        if math.isfinite(start) and math.isfinite(end) and end > start:
             spans.append({'start': start, 'end': end})
     return spans
 
