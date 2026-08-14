@@ -110,3 +110,38 @@ def test_fingerprint_comes_from_the_highest_ranked_duplicate(db):
     assert len(rows) == 1
     assert rows[0]['pattern_id'] == user_id
     assert rows[0]['fingerprint'] == b'chroma-high'
+
+
+def _disable(db, pattern_id):
+    conn = db.get_connection()
+    conn.execute("UPDATE ad_patterns SET is_active = 0 WHERE id = ?", (pattern_id,))
+    conn.commit()
+
+
+def test_active_pattern_survives_a_disabled_higher_tier_one(db):
+    user_id = _add_pattern(db, 'user', 10)
+    auto_id = _add_pattern(db, 'auto', 3)
+    _disable(db, user_id)
+
+    db.deduplicate_patterns()
+
+    conn = db.get_connection()
+    remaining = conn.execute("SELECT id FROM ad_patterns WHERE podcast_id = ?",
+                              (SLUG,)).fetchall()
+    assert len(remaining) == 1
+    assert remaining[0]['id'] == auto_id
+
+
+def test_a_disabled_keeper_does_not_inherit_a_fingerprint(db):
+    user_id = _add_pattern(db, 'user', 10)
+    auto_id = _add_pattern(db, 'auto', 17)
+    _disable(db, user_id)
+    _disable(db, auto_id)
+    db.create_audio_fingerprint(auto_id, b'chroma-auto', 12.5)
+
+    db.deduplicate_patterns()
+
+    conn = db.get_connection()
+    assert conn.execute("SELECT id FROM ad_patterns WHERE podcast_id = ?",
+                         (SLUG,)).fetchone()['id'] == user_id
+    assert _fingerprints(db) == []

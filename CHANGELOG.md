@@ -21,7 +21,18 @@ release notes.
   describes the survivor's audio too; it now moves across when the survivor
   has none. Only fresh audio can rebuild one, and 2.88.1 made the loss likelier
   by ranking operator-written patterns, which rarely carry a fingerprint, above
-  auto-learned ones, which usually do.
+  auto-learned ones, which usually do. The fingerprint moves only onto an
+  active survivor, since fingerprint matching ignores `is_active` and would
+  otherwise keep cutting audio the operator had switched off.
+- Deduplication ranked a disabled pattern above an active one, so a row the
+  operator had switched off could delete the live pattern and absorb its stats.
+  Active now outranks tier and confirmation count both.
+- Deleting a pattern left its audio fingerprint behind. There is no foreign key
+  between the two tables, and the matcher loads fingerprints without checking
+  that the pattern still exists, so the orphan went on cutting the same audio
+  with nothing left to disable or inspect. The single and bulk delete paths now
+  take the fingerprint with the pattern, which the other deletion paths already
+  did.
 
 ## [2.88.1] - 2026-08-13
 

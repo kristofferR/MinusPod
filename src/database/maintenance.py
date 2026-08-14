@@ -228,15 +228,18 @@ class MaintenanceMixin:
         for dup in duplicates:
             all_ids = [int(x) for x in dup['all_ids'].split(',')]
 
-            # Find the pattern to keep: tier outranks confirmation count, so a
-            # user/community pattern is never deleted in favour of an auto one.
+            # Find the pattern to keep. Active outranks disabled, or a row the
+            # operator switched off would delete the live one and take its stats;
+            # then tier, so a user/community pattern never loses to an auto one.
             patterns_cursor = conn.execute(
                 f'''SELECT ap.id, ap.sponsor_id, ks.name AS sponsor,
-                          ap.confirmation_count, ap.false_positive_count
+                          ap.confirmation_count, ap.false_positive_count,
+                          COALESCE(ap.is_active, 1) AS is_active
                     FROM ad_patterns ap
                     LEFT JOIN known_sponsors ks ON ap.sponsor_id = ks.id
                     WHERE ap.id IN ({','.join('?' * len(all_ids))})
-                    ORDER BY (CASE WHEN ap.created_by = 'user' OR ap.source = 'community'
+                    ORDER BY COALESCE(ap.is_active, 1) DESC,
+                             (CASE WHEN ap.created_by = 'user' OR ap.source = 'community'
                                    THEN 0 ELSE 1 END),
                              ap.confirmation_count DESC,
                              ap.id ASC''',
@@ -289,8 +292,12 @@ class MaintenanceMixin:
                 f"({','.join('?' * len(group_ids))})",
                 group_ids
             )}
+            # Only onto an active keeper: fingerprint matching ignores is_active,
+            # so promoting onto a disabled row would keep cutting audio the
+            # operator switched off.
             donor = next((pid for pid in remove_ids if pid in fingerprinted), None)
-            if donor is not None and keep_id not in fingerprinted:
+            if (donor is not None and keep_id not in fingerprinted
+                    and keep_pattern['is_active']):
                 conn.execute(
                     'UPDATE audio_fingerprints SET pattern_id = ? WHERE pattern_id = ?',
                     [keep_id, donor]

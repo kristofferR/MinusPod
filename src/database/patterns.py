@@ -269,6 +269,12 @@ class PatternMixin:
         if not ids:
             return 0
         placeholders = ','.join('?' * len(ids))
+        # Fingerprints first: no FK, no cascade, and an orphan keeps matching
+        # audio with no pattern row left to disable or inspect.
+        conn.execute(
+            f"DELETE FROM audio_fingerprints WHERE pattern_id IN ({placeholders})",
+            ids,
+        )
         cursor = conn.execute(
             f"DELETE FROM ad_patterns WHERE id IN ({placeholders})",
             ids,
@@ -341,6 +347,11 @@ class PatternMixin:
 
     def _delete_ad_pattern_conn(self, conn, pattern_id: int) -> bool:
         """Delete an ad pattern on the caller's connection without committing."""
+        # Fingerprint first: no FK, no cascade, and an orphan keeps matching
+        # audio with no pattern row left to disable or inspect.
+        conn.execute(
+            "DELETE FROM audio_fingerprints WHERE pattern_id = ?", (pattern_id,)
+        )
         cursor = conn.execute(
             "DELETE FROM ad_patterns WHERE id = ?", (pattern_id,)
         )
