@@ -1393,6 +1393,23 @@ def _exclude_category_kept_spans(processed_ads, original_ads,
     return surviving_processed, surviving_original
 
 
+def _pass2_keep_barriers_processed(pass1_kept_markers, pass1_cuts,
+                                    category_kept_processed=None):
+    """Collect every keep marker on the pass-1 processed timeline."""
+    replacement_duration = get_replacement_duration()
+    pass1_processed = [
+        dict(
+            marker,
+            start=adjust_timestamp(
+                marker['start'], pass1_cuts, replacement_duration),
+            end=adjust_timestamp(
+                marker['end'], pass1_cuts, replacement_duration),
+        )
+        for marker in pass1_kept_markers or []
+    ]
+    return [*pass1_processed, *(category_kept_processed or [])]
+
+
 def _stamp_pass2_cut_actions(processed_cuts, original_cuts, actions_map):
     """Stamp remove/beep only after pass-2 candidates become actual cuts.
 
@@ -2198,11 +2215,10 @@ def _exclude_kept_spans_from_verification(verification_ads_processed,
     """
     if not pass1_kept_markers:
         return verification_ads_processed, verification_ads_original, []
-    replacement_duration = get_replacement_duration()
     kept_spans_processed = [
-        (adjust_timestamp(m['start'], pass1_cuts, replacement_duration),
-         adjust_timestamp(m['end'], pass1_cuts, replacement_duration))
-        for m in pass1_kept_markers
+        (marker['start'], marker['end'])
+        for marker in _pass2_keep_barriers_processed(
+            pass1_kept_markers, pass1_cuts)
     ]
     surviving_processed = []
     surviving_original = []
@@ -2683,6 +2699,11 @@ def _run_verification_pass(ctx, processed_path, pass1_cuts,
             category_kept_processed,
             pass1_cuts,
         )
+        keep_barriers_processed = _pass2_keep_barriers_processed(
+            pass1_kept_markers,
+            pass1_cuts,
+            category_kept_processed,
+        )
 
         had_verification_candidates = bool(verification_ads_processed)
         if verification_ads_processed:
@@ -2706,7 +2727,7 @@ def _run_verification_pass(ctx, processed_path, pass1_cuts,
                     cue_gate_enabled=cue_gate_enabled,
                     podcast_id=ctx.podcast_id,
                     segment_actions=segment_actions,
-                    keep_barriers_processed=category_kept_processed,
+                    keep_barriers_processed=keep_barriers_processed,
                 )
 
             if verification_ads_processed:
@@ -2748,7 +2769,7 @@ def _run_verification_pass(ctx, processed_path, pass1_cuts,
                     processed_path, recut_applied, recut_ok = _recut_processed_audio(
                         slug, episode_id, processed_path, v_ads_to_cut,
                         local_audio_processor,
-                        cut_barriers=category_kept_processed,
+                        cut_barriers=keep_barriers_processed,
                     )
                     if recut_ok:
                         _drop_uncovered_pass2_ads(
