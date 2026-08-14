@@ -207,7 +207,8 @@ class MaintenanceMixin:
         Duplicates are patterns with the same text_template and podcast_id,
         regardless of sponsor (sponsor variations are merged together). A
         user or community pattern outranks an auto-learned one; confirmation
-        count only breaks ties within a tier.
+        count only breaks ties within a tier. A duplicate's audio fingerprint
+        moves to the survivor when the survivor has none of its own.
 
         Returns count of duplicates removed."""
         conn = self.get_connection()
@@ -281,23 +282,21 @@ class MaintenanceMixin:
             )
 
             # Duplicates share a text_template, so a loser's fingerprint describes
-            # the keeper's audio too. Promote the best-ranked one when the keeper
-            # has none; only fresh audio can rebuild a lost hash.
+            # the keeper's audio too; promote one when the keeper has none.
+            group_ids = remove_ids + [keep_id]
             fingerprinted = {row['pattern_id'] for row in conn.execute(
-                f'''SELECT pattern_id FROM audio_fingerprints
-                    WHERE pattern_id IN ({placeholders},?)''',
-                remove_ids + [keep_id]
+                'SELECT pattern_id FROM audio_fingerprints WHERE pattern_id IN '
+                f"({','.join('?' * len(group_ids))})",
+                group_ids
             )}
-            if keep_id not in fingerprinted:
-                donor = next((p['id'] for p in patterns[1:] if p['id'] in fingerprinted), None)
-                if donor is not None:
-                    conn.execute(
-                        'UPDATE audio_fingerprints SET pattern_id = ? WHERE pattern_id = ?',
-                        [keep_id, donor]
-                    )
+            donor = next((pid for pid in remove_ids if pid in fingerprinted), None)
+            if donor is not None and keep_id not in fingerprinted:
+                conn.execute(
+                    'UPDATE audio_fingerprints SET pattern_id = ? WHERE pattern_id = ?',
+                    [keep_id, donor]
+                )
 
-            # Delete the rest (UNIQUE pattern_id, no cascade) so they don't
-            # orphan against the removed rows.
+            # Drop the rest before their patterns go (UNIQUE pattern_id, no cascade).
             conn.execute(
                 f'DELETE FROM audio_fingerprints WHERE pattern_id IN ({placeholders})',
                 remove_ids
