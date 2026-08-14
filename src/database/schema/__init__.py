@@ -1229,6 +1229,12 @@ class SchemaMixin:
         # 2.2.10: clear sponsor_id on patterns the 2.2.7 alias backfill mislabeled as Zyn.
         self._cleanup_zyn_cascade(conn)
 
+        # 2.88.2: give audio_fingerprints.pattern_id a real FK with cascade.
+        try:
+            self._migrate_fingerprint_cascade(conn)
+        except Exception as e:
+            logger.error(f"Fingerprint cascade migration failed: {e}")
+
         # Per-stage LLM tunables: rename ad_detection_max_tokens -> detection_max_tokens.
         try:
             self._migrate_ad_detection_max_tokens(conn)
@@ -2947,6 +2953,92 @@ class SchemaMixin:
                 )
         except Exception as e:
             logger.warning(f"Migration: ad-marker Zyn cleanup failed: {e}")
+
+    def _migrate_fingerprint_cascade(self, conn):
+        """2.88.2: give audio_fingerprints.pattern_id an FK with ON DELETE CASCADE.
+
+        Every caller had to remember to delete the fingerprint by hand and two
+        did not, so orphans accumulated and kept matching audio with no pattern
+        row left to disable. Orphans would also fail the new constraint, so they
+        are archived to `_orphaned_audio_fingerprints` rather than dropped. The
+        rebuild aborts and retries next startup if the copy loses a row.
+        """
+        if any(fk['table'] == 'ad_patterns' for fk in
+               conn.execute("PRAGMA foreign_key_list(audio_fingerprints)").fetchall()):
+            return
+
+        orphans = conn.execute(
+            """SELECT af.id, af.pattern_id, af.fingerprint, af.duration, af.created_at
+               FROM audio_fingerprints af
+               LEFT JOIN ad_patterns ap ON af.pattern_id = ap.id
+               WHERE af.pattern_id IS NOT NULL AND ap.id IS NULL"""
+        ).fetchall()
+        if orphans:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS _orphaned_audio_fingerprints (
+                       id INTEGER, pattern_id INTEGER, fingerprint BLOB, duration REAL,
+                       created_at TEXT,
+                       archived_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')))"""
+            )
+            conn.executemany(
+                "INSERT INTO _orphaned_audio_fingerprints "
+                "(id, pattern_id, fingerprint, duration, created_at) VALUES (?, ?, ?, ?, ?)",
+                [(r['id'], r['pattern_id'], r['fingerprint'], r['duration'],
+                  r['created_at']) for r in orphans]
+            )
+            conn.execute(
+                "DELETE FROM audio_fingerprints WHERE id IN "
+                f"({','.join('?' * len(orphans))})", [r['id'] for r in orphans]
+            )
+        # Commit before touching the pragma: it is a no-op inside a transaction.
+        conn.commit()
+
+        expected = conn.execute("SELECT COUNT(*) FROM audio_fingerprints").fetchone()[0]
+        try:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            old_cols = [r['name'] for r in
+                        conn.execute("PRAGMA table_info(audio_fingerprints)").fetchall()]
+            conn.execute("DROP TABLE IF EXISTS audio_fingerprints_new")
+            conn.execute("""
+                CREATE TABLE audio_fingerprints_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pattern_id INTEGER UNIQUE REFERENCES ad_patterns(id) ON DELETE CASCADE,
+                    fingerprint BLOB,
+                    duration REAL,
+                    created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                )
+            """)
+            new_cols = [r['name'] for r in
+                        conn.execute("PRAGMA table_info(audio_fingerprints_new)").fetchall()]
+            cols_str = ', '.join(c for c in old_cols if c in new_cols)
+            conn.execute(
+                f"INSERT INTO audio_fingerprints_new ({cols_str}) "
+                f"SELECT {cols_str} FROM audio_fingerprints"
+            )
+            copied = conn.execute(
+                "SELECT COUNT(*) FROM audio_fingerprints_new").fetchone()[0]
+            if copied != expected:
+                conn.rollback()
+                logger.error(
+                    f"Fingerprint cascade migration: copy parity failed "
+                    f"(expected {expected}, got {copied}); aborting. "
+                    f"Re-run on next startup."
+                )
+                return
+
+            conn.execute("DROP TABLE audio_fingerprints")
+            conn.execute("ALTER TABLE audio_fingerprints_new RENAME TO audio_fingerprints")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_fingerprints_pattern "
+                "ON audio_fingerprints(pattern_id)"
+            )
+            conn.commit()
+            logger.info(
+                f"Fingerprint cascade migration: completed ({expected} rows kept, "
+                f"{len(orphans)} orphans archived to _orphaned_audio_fingerprints)"
+            )
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
 
     def _migrate_sponsor_fk(self, conn):
         """v2.2.0: Migrate ad_patterns.sponsor TEXT to sponsor_id FK.

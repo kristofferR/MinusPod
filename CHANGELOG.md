@@ -27,12 +27,21 @@ release notes.
 - Deduplication ranked a disabled pattern above an active one, so a row the
   operator had switched off could delete the live pattern and absorb its stats.
   Active now outranks tier and confirmation count both.
-- Deleting a pattern left its audio fingerprint behind. There is no foreign key
-  between the two tables, and the matcher loads fingerprints without checking
-  that the pattern still exists, so the orphan went on cutting the same audio
-  with nothing left to disable or inspect. The single and bulk delete paths now
-  take the fingerprint with the pattern, which the other deletion paths already
-  did.
+- Deleting a pattern left its audio fingerprint behind. The matcher loads
+  fingerprints without checking that the pattern still exists, so the orphan
+  went on cutting the same audio with nothing left to disable or inspect. The
+  single and bulk delete paths now take the fingerprint with the pattern, which
+  the other deletion paths already did.
+
+### Changed
+
+- `audio_fingerprints.pattern_id` now carries a real foreign key against
+  `ad_patterns` with `ON DELETE CASCADE`, so a fingerprint can no longer outlive
+  its pattern because a caller forgot to clean up. Existing databases migrate on
+  startup by rebuilding the table. Fingerprints whose pattern is already gone
+  cannot satisfy the constraint, so the migration copies them to
+  `_orphaned_audio_fingerprints` instead of deleting them, and aborts before the
+  destructive step if the row count does not match.
 
 ## [2.88.1] - 2026-08-13
 

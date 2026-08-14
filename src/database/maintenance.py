@@ -301,7 +301,8 @@ class MaintenanceMixin:
                     [keep_id, donor]
                 )
 
-            # Drop the rest before their patterns go (UNIQUE pattern_id, no cascade).
+            # Drop the rest before their patterns go; the FK cascade would too,
+            # but enforcement is per connection so do not lean on it.
             conn.execute(
                 f'DELETE FROM audio_fingerprints WHERE pattern_id IN ({placeholders})',
                 remove_ids
