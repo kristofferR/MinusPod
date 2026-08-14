@@ -11,6 +11,18 @@ release notes.
 
 ## [Unreleased]
 
+## [2.88.2] - 2026-08-13
+
+### Fixed
+
+- Pattern deduplication deleted the audio fingerprints of every duplicate it
+  merged away, so a survivor could end up with no fingerprint even though a
+  duplicate had one. Duplicates share a text template, so that fingerprint
+  describes the survivor's audio too; it now moves across when the survivor
+  has none. Only fresh audio can rebuild one, and 2.88.1 made the loss likelier
+  by ranking operator-written patterns, which rarely carry a fingerprint, above
+  auto-learned ones, which usually do.
+
 ## [2.88.1] - 2026-08-13
 
 ### Changed
@@ -44,24 +56,6 @@ release notes.
   cannot match mid-agent. The list is empty by default, so upgrading
   changes nothing until an operator adds a pattern. Closes #645.
 
-### Changed
-
-- huggingface-hub 1.26.1 to 1.27.0, which pulls in hf-xet 1.5.1 to 1.6.0.
-
-### Fixed
-
-- A verification finding that contradicts a kept pass-1 span is now held for
-  review instead of being discarded. The keep still stands, so pass 2 never
-  cuts through an operator's segment-action choice, but the disagreement is
-  visible and one approval away from a cut. Previously it was dropped with
-  only a debug line to show for it, so an ad the second pass had caught at
-  high confidence vanished silently.
-- The "re-cutting pass 1 output" log fired before the filters that decide
-  whether anything gets re-cut, so it announced work that often never
-  happened. It now reports the actual count, after the gate.
-
-## [2.87.1] - 2026-08-13
-
 ### Tooling (benchmark; not in runtime image)
 
 - Six models added to the sweep roster: `bytedance-seed/seed-2-1-turbo`,
@@ -81,6 +75,7 @@ release notes.
 
 ### Changed
 
+- huggingface-hub 1.26.1 to 1.27.0, which pulls in hf-xet 1.5.1 to 1.6.0.
 - The report's "Errors resolved by retry" section is gone. Every row in it had
   already succeeded, so none affected a score, and its contents were either
   duplicated elsewhere or noise: the largest entry restated what the JSON mode
@@ -93,6 +88,15 @@ release notes.
 
 ### Fixed
 
+- A verification finding that contradicts a kept pass-1 span is now held for
+  review instead of being discarded. The keep still stands, so pass 2 never
+  cuts through an operator's segment-action choice, but the disagreement is
+  visible and one approval away from a cut. Previously it was dropped with
+  only a debug line to show for it, so an ad the second pass had caught at
+  high confidence vanished silently.
+- The "re-cutting pass 1 output" log fired before the filters that decide
+  whether anything gets re-cut, so it announced work that often never
+  happened. It now reports the actual count, after the gate.
 - `benchmark run --dry-run` ignored `--retry-errors`, reporting errored units as
   skipped and under-counting the real queue. The preview now takes the same
   errored-key set the run does.
