@@ -35,6 +35,19 @@ from utils.time import overlap_ratio
 logger = logging.getLogger(__name__)
 
 
+def _adopt_later_marker_end(target: Dict, source: Dict) -> None:
+    """Extend a merged marker and carry provenance only from its new edge."""
+    if source['end'] <= target['end']:
+        return
+    invalidate_tail_provenance(target, source['end'])
+    target['end'] = source['end']
+    if source.get('end_extended_by_content'):
+        target['end_extended_by_content'] = True
+    if source.get('tail_splice_snap') is not None:
+        snap = source['tail_splice_snap']
+        target['tail_splice_snap'] = dict(snap) if isinstance(snap, dict) else snap
+
+
 class Decision(Enum):
     ACCEPT = "ACCEPT"
     REVIEW = "REVIEW"
@@ -1168,7 +1181,7 @@ class AdValidator:
             if 0 <= gap < MERGE_GAP_THRESHOLD:
                 # Always merge small gaps (< 5s)
                 mark_distinct_merge(last, current)
-                last['end'] = max(last['end'], current['end'])
+                _adopt_later_marker_end(last, current)
                 if current.get('reason') and current['reason'] != last.get('reason'):
                     last['reason'] = f"{last.get('reason', '')} + {current['reason']}"
                 if current.get('confidence', 0) > last.get('confidence', 0):
@@ -1179,7 +1192,7 @@ class AdValidator:
             elif 0 <= gap < MAX_SILENT_GAP and not self._has_speech_in_range(last['end'], current['start']):
                 # Merge larger gaps if no speech in between
                 mark_distinct_merge(last, current)
-                last['end'] = max(last['end'], current['end'])
+                _adopt_later_marker_end(last, current)
                 if current.get('reason') and current['reason'] != last.get('reason'):
                     last['reason'] = f"{last.get('reason', '')} + {current['reason']}"
                 if current.get('confidence', 0) > last.get('confidence', 0):
