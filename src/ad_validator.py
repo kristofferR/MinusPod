@@ -21,6 +21,8 @@ from config import (
     CUE_ONLY_SAFETY_HOLD_NEW, CUE_ONLY_SAFETY_AUTO_CUT,
     CUE_ONLY_AUTOCUT_CONFIDENCE,
     HOLD_REASON_CUE_TEMPLATE_UNPROVEN, HOLD_REASON_CUE_LOW_CONFIDENCE,
+    HOLD_REASON_LARGE_VAD_GAP,
+    MAX_ADJACENT_AUTO_EXTENSION_SECONDS,
     normalize_segment_category, DEFAULT_SEGMENT_ACTION,
 )
 from utils.markers import mark_distinct_merge
@@ -28,6 +30,12 @@ from utils.text import extract_text_from_segments
 from utils.time import overlap_ratio
 
 logger = logging.getLogger(__name__)
+
+
+def _vad_gap_adjacency_extension_seconds(ad: Dict) -> float:
+    """Return an ad's accumulated adjacency-only VAD extension."""
+    value = ad.get('vad_gap_adjacency_extension_seconds', 0.0)
+    return float(value) if isinstance(value, (int, float)) else 0.0
 
 
 class Decision(Enum):
@@ -827,6 +835,15 @@ class AdValidator:
         A held ad gets decision=REVIEW with held_for_review=True so the gate
         keeps it in the audio. Returns the (possibly updated) decision.
         """
+        # Adjacency is boundary evidence, not authority to classify an
+        # arbitrarily large untranscribed span. This safety marker is stamped
+        # before validation so it cannot merge into the neighboring ad, then
+        # re-derived here before generic duration holds choose another reason.
+        if (ad.get('detection_stage') == 'vad_gap'
+                and ad.get('vad_gap_requires_review')):
+            self._mark_held(ad, flags, HOLD_REASON_LARGE_VAD_GAP)
+            return Decision.REVIEW
+
         # Rule 1a: per-feed cap holds an ad that would otherwise be cut.
         if (self.max_ad_duration_override is not None
                 and duration > self.max_ad_duration_override
@@ -975,6 +992,11 @@ class AdValidator:
         sorted_ads = sorted(ads, key=lambda x: x['start'])
         last_ad = sorted_ads[-1]
 
+        # A held marker has not been approved for cutting. Extending it could
+        # absorb post-gap speech that was not part of the reviewed span.
+        if last_ad.get('held_for_review') or last_ad.get('vad_gap_requires_review'):
+            return ads
+
         gap_to_end = self.episode_duration - last_ad['end']
 
         # Only extend if gap is positive and within threshold
@@ -1029,15 +1051,15 @@ class AdValidator:
             last = merged[-1]
             gap = current['start'] - last['end']
 
-            # #541, generalized: never merge across a held/not-held boundary
-            # (any hold reason) -- the fold would hold the real ad or cut
-            # the held span, and on an auto-approve recut it would grow the
-            # marker past its trimmed confirm so the confirmed_span clamp
-            # never fires and trimmed-out audio gets cut.
-            if (bool(last.get('differential_uncorroborated'))
-                    != bool(current.get('differential_uncorroborated'))
-                    or bool(last.get('held_for_review'))
-                    != bool(current.get('held_for_review'))):
+            # Pending-review markers represent individual human decisions.
+            # Never merge one with a cut marker or another hold: either fold
+            # can absorb content that was not part of the reviewed span.
+            if (last.get('held_for_review')
+                    or current.get('held_for_review')
+                    or last.get('vad_gap_requires_review')
+                    or current.get('vad_gap_requires_review')
+                    or bool(last.get('differential_uncorroborated'))
+                    != bool(current.get('differential_uncorroborated'))):
                 merged.append(current.copy())
                 continue
 
@@ -1060,10 +1082,22 @@ class AdValidator:
                 merged.append(current.copy())
                 continue
 
+            adjacency_extension = (
+                _vad_gap_adjacency_extension_seconds(last)
+                + _vad_gap_adjacency_extension_seconds(current)
+            )
+            # Each marker can satisfy the adjacency-only safety limit on its
+            # own. Keep them distinct when their union would evade that cap.
+            if adjacency_extension > MAX_ADJACENT_AUTO_EXTENSION_SECONDS:
+                merged.append(current.copy())
+                continue
+
             if 0 <= gap < MERGE_GAP_THRESHOLD:
                 # Always merge small gaps (< 5s)
                 mark_distinct_merge(last, current)
                 last['end'] = max(last['end'], current['end'])
+                if adjacency_extension:
+                    last['vad_gap_adjacency_extension_seconds'] = adjacency_extension
                 if current.get('reason') and current['reason'] != last.get('reason'):
                     last['reason'] = f"{last.get('reason', '')} + {current['reason']}"
                 if current.get('confidence', 0) > last.get('confidence', 0):
@@ -1075,6 +1109,8 @@ class AdValidator:
                 # Merge larger gaps if no speech in between
                 mark_distinct_merge(last, current)
                 last['end'] = max(last['end'], current['end'])
+                if adjacency_extension:
+                    last['vad_gap_adjacency_extension_seconds'] = adjacency_extension
                 if current.get('reason') and current['reason'] != last.get('reason'):
                     last['reason'] = f"{last.get('reason', '')} + {current['reason']}"
                 if current.get('confidence', 0) > last.get('confidence', 0):

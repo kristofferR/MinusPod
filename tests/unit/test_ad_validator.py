@@ -714,6 +714,83 @@ class TestAdValidatorVadGapVerification:
         # stays at or above 0.85 (modulo position adjustments).
         assert result.ads[0]['validation']['adjusted_confidence'] > 0.79
 
+    def test_large_adjacency_only_gap_is_held(self):
+        from config import HOLD_REASON_LARGE_VAD_GAP
+
+        validator = AdValidator(episode_duration=8000.0, segments=[])
+        marker = {
+            'start': 2000.0,
+            'end': 2400.0,
+            'confidence': 0.95,
+            'reason': 'Large VAD gap adjacent to detected ad',
+            'detection_stage': 'vad_gap',
+            'vad_gap_requires_review': True,
+        }
+
+        ad = validator.validate([marker]).ads[0]
+
+        assert ad['validation']['decision'] == Decision.REVIEW.value
+        assert ad['held_for_review'] is True
+        assert ad['hold_reason'] == HOLD_REASON_LARGE_VAD_GAP
+
+    def test_large_gap_hold_does_not_merge_into_adjacent_ad(self):
+        from config import HOLD_REASON_LARGE_VAD_GAP
+
+        validator = AdValidator(episode_duration=500.0, segments=[])
+        adjacent_ad = {
+            'start': 40.0,
+            'end': 50.0,
+            'confidence': 0.95,
+            'reason': 'Sponsor read',
+            'detection_stage': 'claude',
+        }
+        gap = {
+            'start': 50.0,
+            'end': 170.0,
+            'confidence': 0.75,
+            'reason': 'VAD gap exceeds adjacency-only extension limit',
+            'detection_stage': 'vad_gap',
+            'vad_gap_requires_review': True,
+            'held_for_review': True,
+            'was_cut': False,
+            'hold_reason': HOLD_REASON_LARGE_VAD_GAP,
+        }
+
+        result = validator.validate([adjacent_ad, gap])
+
+        assert len(result.ads) == 2
+        held = result.ads[1]
+        assert held['start'] == 50.0
+        assert held['end'] == 170.0
+        assert held['held_for_review'] is True
+        assert held['hold_reason'] == HOLD_REASON_LARGE_VAD_GAP
+
+    def test_held_tail_gap_does_not_extend_into_transcript(self):
+        from config import HOLD_REASON_LARGE_VAD_GAP
+
+        validator = AdValidator(
+            episode_duration=1000.0,
+            segments=[{'start': 990.0, 'end': 1000.0,
+                       'text': 'Thanks for listening to the show.'}],
+        )
+        marker = {
+            'start': 870.0,
+            'end': 990.0,
+            'confidence': 0.75,
+            'reason': 'Large VAD gap at episode tail',
+            'detection_stage': 'vad_gap',
+            'vad_gap_requires_review': True,
+            'held_for_review': True,
+            'was_cut': False,
+            'hold_reason': HOLD_REASON_LARGE_VAD_GAP,
+        }
+
+        ad = validator.validate([marker]).ads[0]
+
+        assert ad['end'] == 990.0
+        assert ad['held_for_review'] is True
+        assert ad['hold_reason'] == HOLD_REASON_LARGE_VAD_GAP
+
 
 class TestPositionalPriorBoost:
     """Tests for learned positional prior boosts (issue #360)."""
@@ -1385,6 +1462,62 @@ def test_merge_never_crosses_held_boundary():
     merged = validator._merge_close_ads(ads, result)
     assert len(merged) == 2
     assert merged[0]['end'] == 160.0
+
+
+def test_distinct_held_markers_never_merge_with_each_other():
+    validator = AdValidator(episode_duration=300.0)
+    result = ValidationResult(ads=[])
+    ads = [
+        {'start': 100.0, 'end': 150.0, 'confidence': 0.75,
+         'held_for_review': True, 'hold_reason': 'large_vad_gap_extension',
+         'vad_gap_requires_review': True},
+        {'start': 152.0, 'end': 200.0, 'confidence': 0.75,
+         'held_for_review': True, 'hold_reason': 'large_vad_gap_extension',
+         'vad_gap_requires_review': True},
+    ]
+
+    merged = validator._merge_close_ads(ads, result)
+
+    assert len(merged) == 2
+    assert merged[0]['end'] == 150.0
+    assert merged[1]['start'] == 152.0
+
+
+def test_recut_keeps_approved_vad_hold_distinct():
+    """A recut clears the hold but retains the VAD safety provenance."""
+    validator = AdValidator(episode_duration=300.0, segments=[])
+    result = ValidationResult(ads=[])
+    ads = [
+        {'start': 100.0, 'end': 150.0, 'confidence': 0.95,
+         'vad_gap_requires_review': True, '_saved_was_cut': True},
+        {'start': 152.0, 'end': 200.0, 'confidence': 0.95,
+         '_saved_was_cut': True},
+    ]
+
+    merged = validator._merge_close_ads(ads, result)
+
+    assert len(merged) == 2
+    assert merged[0]['end'] == 150.0
+
+
+def test_merge_preserves_vad_adjacency_extension_limit():
+    validator = AdValidator(episode_duration=400.0, segments=[])
+    result = ValidationResult(ads=[])
+    ads = [
+        {'start': 100.0, 'end': 150.0, 'confidence': 0.95,
+         'vad_gap_adjacency_extension_seconds': 20.0},
+        {'start': 152.0, 'end': 200.0, 'confidence': 0.95,
+         'vad_gap_adjacency_extension_seconds': 20.0},
+        {'start': 202.0, 'end': 250.0, 'confidence': 0.95,
+         'vad_gap_adjacency_extension_seconds': 25.0},
+    ]
+
+    merged = validator._merge_close_ads(ads, result)
+
+    assert len(merged) == 2
+    assert merged[0]['end'] == 200.0
+    assert merged[0]['vad_gap_adjacency_extension_seconds'] == 40.0
+    assert merged[1]['start'] == 202.0
 
 
 class TestRegistryConfirmsLongAds:
