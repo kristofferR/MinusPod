@@ -1,5 +1,68 @@
 """Marker-dict bookkeeping shared by the detector, validator, and reviewer."""
-from typing import Dict, Optional, Tuple
+import math
+from typing import Dict, List, Optional, Tuple
+
+DAI_CORE_SPANS = 'dai_core_spans'
+
+
+def _valid_dai_core_spans(marker: Dict) -> List[Dict[str, float]]:
+    """Return normalized measured DAI spans from a marker.
+
+    Invalid persisted values are ignored. Keeping this parser defensive lets
+    old markers and hand-edited JSON pass through unchanged.
+    """
+    raw_spans = marker.get(DAI_CORE_SPANS)
+    if not isinstance(raw_spans, list):
+        return []
+    spans = []
+    for raw in raw_spans:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            start = float(raw['start'])
+            end = float(raw['end'])
+        except (KeyError, OverflowError, TypeError, ValueError):
+            continue
+        if math.isfinite(start) and math.isfinite(end) and end > start:
+            spans.append({'start': start, 'end': end})
+    return spans
+
+
+def merge_dai_core_spans(target: Dict, other: Dict) -> None:
+    """Carry measured DAI regions through a marker merge."""
+    spans = _valid_dai_core_spans(target) + _valid_dai_core_spans(other)
+    if not spans:
+        return
+    spans.sort(key=lambda span: span['start'])
+    merged = [spans[0]]
+    for span in spans[1:]:
+        if span['start'] <= merged[-1]['end'] + 0.05:
+            merged[-1]['end'] = max(merged[-1]['end'], span['end'])
+        else:
+            merged.append(span)
+    target[DAI_CORE_SPANS] = merged
+
+
+def clip_dai_core_spans(marker: Dict, start: float, end: float) -> None:
+    """Clip a marker's DAI evidence to a newly split/clamped range."""
+    clipped = []
+    for span in _valid_dai_core_spans(marker):
+        lo = max(start, span['start'])
+        hi = min(end, span['end'])
+        if hi > lo:
+            clipped.append({'start': lo, 'end': hi})
+    if clipped:
+        marker[DAI_CORE_SPANS] = clipped
+    else:
+        marker.pop(DAI_CORE_SPANS, None)
+
+
+def dai_core_bounds(marker: Dict) -> Tuple[Optional[float], Optional[float]]:
+    """Return the outer bounds of measured DAI evidence, if present."""
+    spans = _valid_dai_core_spans(marker)
+    if not spans:
+        return None, None
+    return min(s['start'] for s in spans), max(s['end'] for s in spans)
 
 # Stages whose spans carry alignment-derived padding (especially tails)
 # rather than transcript- or splice-anchored bounds. Members from these
@@ -29,6 +92,7 @@ def note_merged_members(target: Dict, other: Dict) -> None:
     anchored) so the reviewer can tell a tracked merge from a legacy
     marker persisted by a pre-tracking release.
     """
+    merge_dai_core_spans(target, other)
     if 'merged_protected_start' not in target:
         target['merged_protected_start'], target['merged_protected_end'] = (
             _protected_bounds(target))

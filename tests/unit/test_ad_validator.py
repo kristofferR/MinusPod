@@ -283,6 +283,29 @@ class TestAdValidatorBoundaries:
         assert result.ads[0]['end'] == 300.0
         assert 'Clamped end' in ' '.join(result.corrections)
 
+    def test_automatic_snap_cannot_narrow_measured_dai_core(
+            self, sample_transcript):
+        validator = AdValidator(
+            episode_duration=300.0, segments=sample_transcript)
+        snapped_ad = {
+            'start': 110.0,
+            'end': 150.0,
+            'confidence': 0.95,
+            'reason': 'DAI candidate narrowed by cue snap',
+            'detection_stage': 'dai_differential',
+            'dai_core_spans': [{'start': 100.0, 'end': 160.0}],
+        }
+
+        result = validator.validate([snapped_ad])
+
+        assert result.ads[0]['start'] == 100.0
+        assert result.ads[0]['end'] == 160.0
+        assert result.ads[0]['dai_core_spans'] == [
+            {'start': 100.0, 'end': 160.0},
+        ]
+        assert 'Restored start' in ' '.join(result.corrections)
+        assert 'Restored end' in ' '.join(result.corrections)
+
 
 class TestAdValidatorResults:
     """Tests for validation result counts and structure."""
@@ -528,6 +551,31 @@ class TestConfirmedCorrections:
         assert out['start'] == 130.0
         assert out['end'] == 200.0
         assert 'INFO: Clamped to user-approved span' in out['validation']['flags']
+
+    def test_trimmed_confirm_clips_dai_core_to_user_approved_span(self):
+        confirmed = [
+            {'start': 100.0, 'end': 160.0,
+             'confirmed_span': {'start': 120.0, 'end': 140.0}}
+        ]
+        validator = AdValidator(
+            episode_duration=600.0,
+            segments=[],
+            confirmed_corrections=confirmed,
+        )
+        ad = {
+            'start': 100.0,
+            'end': 160.0,
+            'confidence': 0.95,
+            'reason': 'Dynamically inserted ad',
+            'detection_stage': 'dai_differential',
+            'dai_core_spans': [{'start': 100.0, 'end': 160.0}],
+        }
+
+        out = validator.validate([ad]).ads[0]
+
+        assert out['start'] == 120.0
+        assert out['end'] == 140.0
+        assert out['dai_core_spans'] == [{'start': 120.0, 'end': 140.0}]
 
     def test_plain_confirm_does_not_clamp(self):
         """A confirm without confirmed_span accepts the ad at its own bounds."""

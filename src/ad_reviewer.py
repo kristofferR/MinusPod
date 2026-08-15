@@ -29,6 +29,7 @@ from llm_client import (
 )
 from utils.llm_call import call_llm, call_llm_for_window
 from utils.llm_response import extract_json_ads_array, extract_json_object
+from utils.markers import dai_core_bounds
 from utils.prompt import format_sponsor_block, render_prompt, apply_override
 from utils.text import (
     BOUNDARY_SNAP_TOLERANCE_S,
@@ -1072,6 +1073,23 @@ class AdReviewer:
                 )
             clamped_start, clamped_end = floor_start, floor_end
 
+        # Cross-fetch evidence remains authoritative inside a merged
+        # candidate. The reviewer may trim coarse LLM/VAD extensions outside
+        # these measured regions, but cannot leave part of an inserted block
+        # in the published episode.
+        core_start, core_end = dai_core_bounds(ad)
+        if core_start is not None:
+            floor_start = min(clamped_start, core_start)
+            floor_end = max(clamped_end, core_end)
+            if floor_start != clamped_start or floor_end != clamped_end:
+                logger.info(
+                    f"[{slug}:{episode_id}] Reviewer inward shrink clamped "
+                    f"to DAI core @ {core_start:.1f}-{core_end:.1f}s: "
+                    f"{clamped_start:.1f}-{clamped_end:.1f} -> "
+                    f"{floor_start:.1f}-{floor_end:.1f}"
+                )
+            clamped_start, clamped_end = floor_start, floor_end
+
         if clamped_end <= clamped_start:
             clamped_start, clamped_end = original_start, original_end
         return clamped_start, clamped_end
@@ -1174,16 +1192,27 @@ class AdReviewer:
         end = min(end, o_end)
         if end <= start:
             return None
-        # Must be a strict sub-span: a result that shrinks the span by less
-        # than the confirmed-boundary tolerance is indistinguishable from
-        # the full span and offers no trim worth surfacing.
+        # Widen back out to the protected union so a tracked merged ad's
+        # recovered trim cannot sever a transcript-anchored member.
+        if ad.get('merged_distinct_ads'):
+            p_start = ad.get('merged_protected_start')
+            p_end = ad.get('merged_protected_end')
+            if p_start is not None:
+                start = min(start, p_start)
+            if p_end is not None:
+                end = max(end, p_end)
+        core_start, core_end = dai_core_bounds(ad)
+        if core_start is not None:
+            start = min(start, core_start)
+            end = max(end, core_end)
+        # Protected merge members or measured DAI evidence can widen the
+        # recovered proposal back to the full marker. That is no longer a
+        # trim, so neither review path should surface it as one.
         if (start - o_start) + (o_end - end) <= _CONFIRMED_BOUNDARY_TOLERANCE_S:
             return None
-        # Sanity floor: a recovered ad portion shorter than the minimum we would
-        # ever remove from audio is more likely a hallucinated sub-span than a
-        # real trim of a span the model itself flagged as an ad. Fall back to
-        # holding without bounds (today's behavior) rather than pre-fill the
-        # review UI with a bad one-tap trim.
+        # Evaluate the render floor after protected bounds expand the model's
+        # raw proposal. A tiny proposal inside a substantial measured core is
+        # still a valid core-sized trim.
         if end - start < MIN_AD_DURATION_FOR_REMOVAL:
             logger.info(
                 f"[{slug}:{episode_id}] {call_label} recovered trim "
@@ -1196,15 +1225,6 @@ class AdReviewer:
             f"[{slug}:{episode_id}] {call_label} recovered proposed trim "
             f"{start:.1f}-{end:.1f}s from span {o_start:.1f}-{o_end:.1f}s"
         )
-        # Widen back out to the protected union so a tracked merged ad's
-        # recovered trim cannot sever a transcript-anchored member.
-        if ad.get('merged_distinct_ads'):
-            p_start = ad.get('merged_protected_start')
-            p_end = ad.get('merged_protected_end')
-            if p_start is not None:
-                start = min(start, p_start)
-            if p_end is not None:
-                end = max(end, p_end)
         return start, end
 
     @staticmethod

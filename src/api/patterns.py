@@ -14,6 +14,7 @@ from pattern_service import PatternService
 from pattern_variants import derive_intro_outro, merge_variants
 from pattern_clusters import merge_suggestions
 from split_planning import build_split_pieces
+from utils.markers import clip_dai_core_spans
 from utils.pattern_similarity import VARIANT_THRESHOLD, canonicalize_for_dedupe, similarity
 from utils.text import (
     BOUNDARY_SNAP_TOLERANCE_S, extract_timed_spans_in_range,
@@ -868,6 +869,7 @@ def _submit_correction_split(db, pattern_service, slug, episode_id,
             'reason': f"Split from {original_start:.1f}s-{original_end:.1f}s block",
             'pattern_id': piece_id,
         })
+        clip_dai_core_spans(split_marker, piece['start'], piece['end'])
         new_markers.append(split_marker)
 
         db.create_pattern_correction(

@@ -153,6 +153,19 @@ class TestSplitting:
             assert m['detection_stage'] == 'dai_differential'
             assert m['was_cut'] is True
 
+    def test_pieces_clip_dai_cores_to_their_own_bounds(self, app_client, merged):
+        marker = dict(MERGED_MARKER, dai_core_spans=[{'start': 110.0, 'end': 180.0}])
+        merged['db'].save_episode_details(
+            merged['slug'], merged['episodeId'], ad_markers=[marker])
+
+        assert _split(app_client, merged, [130.0, 160.0]).status_code == 200
+
+        assert [m.get('dai_core_spans') for m in _markers(merged)] == [
+            [{'start': 110.0, 'end': 130.0}],
+            [{'start': 130.0, 'end': 160.0}],
+            [{'start': 160.0, 'end': 180.0}],
+        ]
+
     def test_a_pattern_is_minted_per_piece(self, app_client, merged):
         body = _split(app_client, merged, [130.0]).get_json()
         assert len(body['patternIds']) >= 1
