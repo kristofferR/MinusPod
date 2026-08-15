@@ -1242,6 +1242,7 @@ def snap_terminal_ad_to_splice(ads: List[Dict], segments: List[Dict],
                                episode_duration: float,
                                window_s: float,
                                coverage_ads: Optional[List[Dict]] = None,
+                               blocking_ads: Optional[List[Dict]] = None,
                                eof_tolerance_s: float = TERMINAL_SNAP_EOF_TOLERANCE_SECONDS,
                                podcast_name: str = None) -> List[Dict]:
     """Snap a terminal ad's start back to the strongest deep-silence splice.
@@ -1268,7 +1269,9 @@ def snap_terminal_ad_to_splice(ads: List[Dict], segments: List[Dict],
         if episode_duration - ad_copy['end'] <= eof_tolerance_s:
             candidates = [
                 e for e in splice_events
-                if e.get('type') in ('digital_silence', 'deep_silence')
+                if e.get('type') in (
+                    'digital_silence', 'deep_silence',
+                    'dai_transition_silence')
                 and e.get('time') is not None
                 and ad_copy['start'] - window_s <= e['time'] < ad_copy['start']
             ]
@@ -1280,6 +1283,13 @@ def snap_terminal_ad_to_splice(ads: List[Dict], segments: List[Dict],
             ad_sponsors = extract_sponsor_names(
                 ad_text, ad_copy.get('reason'), exclude=own_site)
             for event in candidates:
+                if any(
+                        blocker.get('start') is not None
+                        and blocker.get('end') is not None
+                        and blocker['start'] < ad_copy['start']
+                        and blocker['end'] > event['time']
+                        for blocker in (blocking_ads or [])):
+                    continue
                 if _span_blocked_by_content(segments, coverage, ad_sponsors,
                                             event['time'], ad_copy['start']):
                     continue
@@ -1297,6 +1307,140 @@ def snap_terminal_ad_to_splice(ads: List[Dict], segments: List[Dict],
                     f"depth {event.get('depth_dbfs')} dBFS)"
                 )
                 break
+        out.append(ad_copy)
+    return out
+
+
+def transition_pair_silence_events(signals: List,
+                                   silence_spans: List[Dict],
+                                   max_distance_s: float,
+                                   min_silence_s: float,
+                                   min_confidence: float = 0.9) -> List[Dict]:
+    """Derive precise terminal-boundary evidence from a coarse DAI pair.
+
+    Transition pairs use five-second loudness frames, so their edge alone is
+    too coarse for a destructive snap. A nearby measured silence gives the
+    precise boundary. Return splice-shaped events so the terminal content
+    guard can apply its existing transcript safety checks.
+    """
+    events = []
+    for signal in signals or []:
+        signal_type = (signal.get('signal_type') if isinstance(signal, dict)
+                       else getattr(signal, 'signal_type', None))
+        confidence = (signal.get('confidence', 0.0) if isinstance(signal, dict)
+                      else getattr(signal, 'confidence', 0.0))
+        transition_start = (signal.get('start') if isinstance(signal, dict)
+                            else getattr(signal, 'start', None))
+        if (signal_type != 'dai_transition_pair'
+                or confidence < min_confidence
+                or transition_start is None):
+            continue
+
+        candidates = []
+        for span in silence_spans or []:
+            start = span.get('start')
+            end = span.get('end')
+            if start is None or end is None or end <= start:
+                continue
+            duration = span.get('duration', end - start)
+            midpoint = (start + end) / 2.0
+            distance = abs(midpoint - transition_start)
+            if duration >= min_silence_s and distance <= max_distance_s:
+                candidates.append((distance, midpoint, start, end, duration))
+        if not candidates:
+            continue
+
+        _, midpoint, start, end, duration = min(candidates)
+        events.append({
+            'time': midpoint,
+            'end_time': end,
+            'type': 'dai_transition_silence',
+            'depth_dbfs': None,
+            'duration_s': duration,
+            'transition_time': transition_start,
+            'silence_start': start,
+            'silence_end': end,
+        })
+    return events
+
+
+def snap_extended_ad_tails_to_splice(ads: List[Dict], segments: List[Dict],
+                                     splice_events: List[Dict],
+                                     window_s: float = BOUNDARY_EXTENSION_WINDOW,
+                                     coverage_ads: Optional[List[Dict]] = None,
+                                     podcast_name: str = None) -> List[Dict]:
+    """Finish a content-extended ad at a nearby forward splice boundary.
+
+    The post-review tail sweep can recover a spoken CTA from transcript text,
+    but a short untranscribed sonic logo may follow it. Only markers that the
+    tail sweep already extended are eligible. From their new end, scan forward
+    for strong silence splice evidence without crossing another marker or any
+    transcribed content. This keeps the recovery narrow while preventing the
+    final few seconds of a DAI spot from leaking into the processed episode.
+    """
+    if not ads or not splice_events or window_s <= 0:
+        return ads
+
+    coverage = coverage_ads if coverage_ads is not None else ads
+    own_site = SponsorService.own_site_tokens(podcast_name)
+    out = []
+    for ad in ads:
+        ad_copy = ad.copy()
+        if not ad_copy.get('end_extended_by_content'):
+            out.append(ad_copy)
+            continue
+
+        original_end = ad_copy['end']
+        barriers = []
+        for marker in coverage:
+            same_marker = marker is ad or (
+                marker.get('start') == ad_copy.get('start')
+                and marker.get('end') == original_end
+            )
+            if same_marker or marker.get('start') is None:
+                continue
+            if marker.get('end') is None or marker['end'] <= original_end:
+                continue
+            # An overlapping marker blocks immediately; a later marker caps
+            # the scan at its start.
+            barriers.append(max(original_end, marker['start']))
+        end_cap = min([original_end + window_s] + barriers)
+        candidates = [
+            event for event in splice_events
+            if event.get('type') in ('digital_silence', 'deep_silence')
+            and event.get('time') is not None
+            and original_end < event['time'] <= end_cap
+        ]
+        # The nearest strong splice is the conservative boundary. A later one
+        # could be a pause inside untranscribed show music; depth only breaks a
+        # same-time tie.
+        candidates.sort(key=lambda event: (
+            event['time'],
+            event['depth_dbfs'] if event.get('depth_dbfs') is not None else 0.0,
+        ))
+
+        ad_text = get_transcript_text_for_range(
+            segments, ad_copy['start'], original_end).lower()
+        ad_sponsors = extract_sponsor_names(
+            ad_text, ad_copy.get('reason'), exclude=own_site)
+        for event in candidates:
+            if _span_blocked_by_content(
+                    segments, coverage, ad_sponsors,
+                    original_end, event['time']):
+                continue
+            ad_copy['end'] = event['time']
+            ad_copy['tail_splice_snap'] = {
+                'original_end': original_end,
+                'event_time': event['time'],
+                'event_type': event['type'],
+                'depth_dbfs': event.get('depth_dbfs'),
+            }
+            logger.info(
+                f"Tail splice snap: ad end {original_end:.1f}s -> "
+                f"{event['time']:.1f}s ({event['type']}, "
+                f"depth {event.get('depth_dbfs')} dBFS)"
+            )
+            break
         out.append(ad_copy)
     return out
 
