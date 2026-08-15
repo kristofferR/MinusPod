@@ -223,7 +223,7 @@ TABLE_DDL['pattern_corrections'] = """CREATE TABLE IF NOT EXISTS pattern_correct
 
 TABLE_DDL['audio_fingerprints'] = """CREATE TABLE IF NOT EXISTS audio_fingerprints (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    pattern_id INTEGER UNIQUE,
+    pattern_id INTEGER UNIQUE REFERENCES ad_patterns(id) ON DELETE CASCADE,
     fingerprint BLOB,
     duration REAL,
     created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))

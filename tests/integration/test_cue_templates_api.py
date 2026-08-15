@@ -389,7 +389,10 @@ def test_xep_intro_max_duration_from_db(app_client, seeded):
                     headers=hdr,
                 )
                 assert r.status_code == 200
-                time.sleep(0.5)  # background thread
+                for _ in range(50):  # poll the background thread, not a fixed wait
+                    if captured:
+                        break
+                    time.sleep(0.1)
 
     assert captured.get('intro_max_duration') == 45.0, (
         f"Expected intro_max_duration=45.0 from DB setting, got {captured}"

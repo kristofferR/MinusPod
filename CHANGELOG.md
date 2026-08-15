@@ -11,6 +11,75 @@ release notes.
 
 ## [Unreleased]
 
+## [2.88.3] - 2026-08-14
+
+### Fixed
+
+- The shared processing status file corrupted under concurrent writes, roughly
+  1.7 times a day on a two-worker instance. Every writer used one temp filename
+  and opened it with `w`, which truncates before the lock is taken, so one
+  worker could wipe another's partial write and both renamed the result into
+  place. The next reader hit a JSON error and the file was reset, dropping the
+  current job, the queue display, and the recorded server start time. Each
+  writer now gets its own temp file and an atomic replace, through a shared
+  helper that also fixes the identical pattern in the processing queue's own
+  state file.
+- Status updates were also lost outright between workers, since the only guard
+  around read-modify-write was a `threading.Lock` that does not reach past its
+  own process. With four concurrent writers, 7 of 40 queue additions survived.
+  A file lock now spans workers, and all 40 survive.
+
+- Reading the status file rewrote it whenever it expired a stale job, so a
+  status poll could write and the timeout warning fired from whichever SSE
+  thread happened to read first. Expiry is now separate: read-only callers
+  apply it in memory, and only the paths that were already writing persist it.
+  Recovering a corrupt file still rewrites, since that is one-shot.
+- Startup reconciliation held the cross-process status lock across a SQLite
+  write, which can block for the 30 second busy timeout with every status
+  request queued behind it. The database reset now runs outside the lock.
+- An SSE subscriber was handed a status snapshot and then discarded it to
+  fetch the same data again, costing one extra lock acquisition per open
+  stream per update. `to_dict` now accepts the snapshot.
+- `_migrate_sponsor_fk` could leave its table rebuild in an open transaction
+  and the connection with foreign keys disabled if a step failed, letting a
+  later migration commit a half-finished rebuild. It now rolls back, the same
+  fix applied to the fingerprint migration.
+
+## [2.88.2] - 2026-08-13
+
+### Fixed
+
+- Pattern deduplication deleted the audio fingerprints of every duplicate it
+  merged away, so a survivor could end up with no fingerprint even though a
+  duplicate had one. Duplicates share a text template, so that fingerprint
+  describes the survivor's audio too; it now moves across when the survivor
+  has none. Only fresh audio can rebuild one, and 2.88.1 made the loss likelier
+  by ranking operator-written patterns, which rarely carry a fingerprint, above
+  auto-learned ones, which usually do. The fingerprint moves only onto an
+  active survivor, since fingerprint matching ignores `is_active` and would
+  otherwise keep cutting audio the operator had switched off.
+- Deduplication ranked a disabled pattern above an active one, so a row the
+  operator had switched off could delete the live pattern and absorb its stats.
+  Active now outranks tier and confirmation count both.
+- Deleting a pattern left its audio fingerprint behind. The matcher loads
+  fingerprints without checking that the pattern still exists, so the orphan
+  went on cutting the same audio with nothing left to disable or inspect. The
+  single and bulk delete paths now take the fingerprint with the pattern, which
+  the other deletion paths already did.
+
+### Changed
+
+- `audio_fingerprints.pattern_id` now carries a real foreign key against
+  `ad_patterns` with `ON DELETE CASCADE`, so a fingerprint can no longer outlive
+  its pattern because a caller forgot to clean up. Existing databases migrate on
+  startup by rebuilding the table. Fingerprints whose pattern is already gone
+  cannot satisfy the constraint, so the migration copies them to
+  `_orphaned_audio_fingerprints` instead of deleting them, and aborts before the
+  destructive step if the row count does not match. Databases created around
+  v0.1.107 already carry this constraint, since v0.1.108 dropped it from the
+  schema without rebuilding tables that already existed; those are detected and
+  left alone.
+
 ## [2.88.1] - 2026-08-13
 
 ### Changed
@@ -44,24 +113,6 @@ release notes.
   cannot match mid-agent. The list is empty by default, so upgrading
   changes nothing until an operator adds a pattern. Closes #645.
 
-### Changed
-
-- huggingface-hub 1.26.1 to 1.27.0, which pulls in hf-xet 1.5.1 to 1.6.0.
-
-### Fixed
-
-- A verification finding that contradicts a kept pass-1 span is now held for
-  review instead of being discarded. The keep still stands, so pass 2 never
-  cuts through an operator's segment-action choice, but the disagreement is
-  visible and one approval away from a cut. Previously it was dropped with
-  only a debug line to show for it, so an ad the second pass had caught at
-  high confidence vanished silently.
-- The "re-cutting pass 1 output" log fired before the filters that decide
-  whether anything gets re-cut, so it announced work that often never
-  happened. It now reports the actual count, after the gate.
-
-## [2.87.1] - 2026-08-13
-
 ### Tooling (benchmark; not in runtime image)
 
 - Six models added to the sweep roster: `bytedance-seed/seed-2-1-turbo`,
@@ -81,6 +132,7 @@ release notes.
 
 ### Changed
 
+- huggingface-hub 1.26.1 to 1.27.0, which pulls in hf-xet 1.5.1 to 1.6.0.
 - The report's "Errors resolved by retry" section is gone. Every row in it had
   already succeeded, so none affected a score, and its contents were either
   duplicated elsewhere or noise: the largest entry restated what the JSON mode
@@ -93,6 +145,15 @@ release notes.
 
 ### Fixed
 
+- A verification finding that contradicts a kept pass-1 span is now held for
+  review instead of being discarded. The keep still stands, so pass 2 never
+  cuts through an operator's segment-action choice, but the disagreement is
+  visible and one approval away from a cut. Previously it was dropped with
+  only a debug line to show for it, so an ad the second pass had caught at
+  high confidence vanished silently.
+- The "re-cutting pass 1 output" log fired before the filters that decide
+  whether anything gets re-cut, so it announced work that often never
+  happened. It now reports the actual count, after the gate.
 - `benchmark run --dry-run` ignored `--retry-errors`, reporting errored units as
   skipped and under-counting the real queue. The preview now takes the same
   errored-key set the run does.

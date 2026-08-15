@@ -1,4 +1,4 @@
-"""deduplicate_patterns must keep a user/community pattern over an auto one."""
+"""deduplicate_patterns tier ordering, and fingerprint retention across a merge."""
 import os
 import sys
 
@@ -28,6 +28,11 @@ def _add_pattern(db, created_by, confirmation_count, source='local'):
     ).lastrowid
     conn.commit()
     return pattern_id
+
+
+def _fingerprints(db):
+    return db.get_connection().execute(
+        "SELECT pattern_id, fingerprint, duration FROM audio_fingerprints").fetchall()
 
 
 def test_user_pattern_survives_a_more_confirmed_auto_pattern(db):
@@ -61,3 +66,82 @@ def test_confirmation_count_still_breaks_ties_within_a_tier(db):
     assert remaining[0]['id'] == high_id
     assert conn.execute("SELECT COUNT(*) FROM ad_patterns WHERE id = ?",
                          (low_id,)).fetchone()[0] == 0
+
+
+def test_keeper_without_a_fingerprint_inherits_one_from_a_duplicate(db):
+    user_id = _add_pattern(db, 'user', 10)
+    auto_id = _add_pattern(db, 'auto', 17)
+    db.create_audio_fingerprint(auto_id, b'chroma-auto', 12.5)
+
+    db.deduplicate_patterns()
+
+    rows = _fingerprints(db)
+    assert len(rows) == 1
+    assert rows[0]['pattern_id'] == user_id
+    assert rows[0]['fingerprint'] == b'chroma-auto'
+    assert rows[0]['duration'] == 12.5
+
+
+def test_keeper_with_a_fingerprint_keeps_its_own(db):
+    user_id = _add_pattern(db, 'user', 10)
+    auto_id = _add_pattern(db, 'auto', 17)
+    db.create_audio_fingerprint(user_id, b'chroma-user', 9.0)
+    db.create_audio_fingerprint(auto_id, b'chroma-auto', 12.5)
+
+    db.deduplicate_patterns()
+
+    rows = _fingerprints(db)
+    assert len(rows) == 1
+    assert rows[0]['pattern_id'] == user_id
+    assert rows[0]['fingerprint'] == b'chroma-user'
+
+
+def test_fingerprint_comes_from_the_highest_ranked_duplicate(db):
+    user_id = _add_pattern(db, 'user', 10)
+    auto_high = _add_pattern(db, 'auto', 17)
+    auto_low = _add_pattern(db, 'auto', 3)
+    # inserted low first: promotion follows rank, not insertion order
+    db.create_audio_fingerprint(auto_low, b'chroma-low', 4.0)
+    db.create_audio_fingerprint(auto_high, b'chroma-high', 12.5)
+
+    db.deduplicate_patterns()
+
+    rows = _fingerprints(db)
+    assert len(rows) == 1
+    assert rows[0]['pattern_id'] == user_id
+    assert rows[0]['fingerprint'] == b'chroma-high'
+
+
+def _disable(db, pattern_id):
+    conn = db.get_connection()
+    conn.execute("UPDATE ad_patterns SET is_active = 0 WHERE id = ?", (pattern_id,))
+    conn.commit()
+
+
+def test_active_pattern_survives_a_disabled_higher_tier_one(db):
+    user_id = _add_pattern(db, 'user', 10)
+    auto_id = _add_pattern(db, 'auto', 3)
+    _disable(db, user_id)
+
+    db.deduplicate_patterns()
+
+    conn = db.get_connection()
+    remaining = conn.execute("SELECT id FROM ad_patterns WHERE podcast_id = ?",
+                              (SLUG,)).fetchall()
+    assert len(remaining) == 1
+    assert remaining[0]['id'] == auto_id
+
+
+def test_a_disabled_keeper_does_not_inherit_a_fingerprint(db):
+    user_id = _add_pattern(db, 'user', 10)
+    auto_id = _add_pattern(db, 'auto', 17)
+    _disable(db, user_id)
+    _disable(db, auto_id)
+    db.create_audio_fingerprint(auto_id, b'chroma-auto', 12.5)
+
+    db.deduplicate_patterns()
+
+    conn = db.get_connection()
+    assert conn.execute("SELECT id FROM ad_patterns WHERE podcast_id = ?",
+                         (SLUG,)).fetchone()['id'] == user_id
+    assert _fingerprints(db) == []

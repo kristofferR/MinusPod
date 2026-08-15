@@ -269,6 +269,11 @@ class PatternMixin:
         if not ids:
             return 0
         placeholders = ','.join('?' * len(ids))
+        # Explicit as well as the FK cascade: enforcement is per connection.
+        conn.execute(
+            f"DELETE FROM audio_fingerprints WHERE pattern_id IN ({placeholders})",
+            ids,
+        )
         cursor = conn.execute(
             f"DELETE FROM ad_patterns WHERE id IN ({placeholders})",
             ids,
@@ -341,6 +346,10 @@ class PatternMixin:
 
     def _delete_ad_pattern_conn(self, conn, pattern_id: int) -> bool:
         """Delete an ad pattern on the caller's connection without committing."""
+        # Explicit as well as the FK cascade: enforcement is per connection.
+        conn.execute(
+            "DELETE FROM audio_fingerprints WHERE pattern_id = ?", (pattern_id,)
+        )
         cursor = conn.execute(
             "DELETE FROM ad_patterns WHERE id = ?", (pattern_id,)
         )
@@ -357,8 +366,8 @@ class PatternMixin:
         reconciliation, not an explicit operator purge.
 
         Also deletes audio_fingerprints rows that point at the doomed
-        patterns; the schema does not declare an ON DELETE CASCADE on
-        `pattern_id`, so we clean them up explicitly.
+        patterns. The FK cascades, but only on a connection with
+        foreign_keys on, so the delete stays explicit.
         """
         conn = self.get_connection()
         conn.execute(

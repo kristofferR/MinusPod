@@ -151,3 +151,23 @@ def test_episodes_still_cascade(db):
 
 def test_deleting_a_feed_that_does_not_exist_reports_nothing_deleted(db):
     assert db.delete_podcast('never-existed') is False
+
+
+def test_delete_ad_pattern_takes_its_fingerprint(db):
+    _add_feed(db)
+    pattern_id = _add_pattern(db, SLUG)
+
+    assert db.delete_ad_pattern(pattern_id) is True
+
+    assert db.get_audio_fingerprint(pattern_id) is None
+
+
+def test_bulk_delete_patterns_takes_their_fingerprints(db):
+    _add_feed(db)
+    first = _add_pattern(db, SLUG)
+    second = _add_pattern(db, SLUG)
+
+    assert db.bulk_delete_patterns([first, second]) == 2
+
+    assert db.get_audio_fingerprint(first) is None
+    assert db.get_audio_fingerprint(second) is None
