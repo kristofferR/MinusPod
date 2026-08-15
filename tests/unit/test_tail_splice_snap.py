@@ -4,7 +4,10 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
 
-from ad_detector.boundaries import snap_extended_ad_tails_to_splice
+from ad_detector.boundaries import (
+    _merge_ad_pair,
+    snap_extended_ad_tails_to_splice,
+)
 
 
 def _event(time, depth=-120.0, event_type='digital_silence'):
@@ -106,6 +109,33 @@ def test_overlapping_marker_blocks_tail_extension_immediately():
     assert result[0]['end'] == 2410.9
 
 
+def test_later_marker_does_not_hide_content_before_proposed_splice():
+    marker = {
+        'start': 70.0,
+        'end': 100.0,
+        'confidence': 0.97,
+        'reason': 'Sponsor ad',
+        'end_extended_by_content': True,
+    }
+    next_marker = {
+        'start': 110.0,
+        'end': 130.0,
+        'reason': 'Separate ad marker',
+    }
+    segments = [{
+        'start': 105.0,
+        'end': 115.0,
+        'text': 'Now we return to the game analysis.',
+    }]
+
+    result = snap_extended_ad_tails_to_splice(
+        [marker], segments, [_event(108.0)], window_s=10.0,
+        coverage_ads=[marker, next_marker])
+
+    assert result[0]['end'] == 100.0
+    assert 'tail_splice_snap' not in result[0]
+
+
 def test_non_silence_and_far_events_are_ignored():
     marker, segments = _fixture()
     events = [
@@ -117,3 +147,50 @@ def test_non_silence_and_far_events_are_ignored():
         [marker], segments, events, window_s=10.0)
 
     assert result[0]['end'] == 2410.9
+
+
+def test_merge_clears_stale_content_extension_from_earlier_fragment():
+    ads = [
+        {
+            'start': 100.0,
+            'end': 130.0,
+            'confidence': 0.9,
+            'reason': 'Sponsor ad part one',
+            'end_extended_by_content': True,
+        },
+        {
+            'start': 132.0,
+            'end': 160.0,
+            'confidence': 0.9,
+            'reason': 'Sponsor ad part two',
+        },
+    ]
+
+    merged = ads[0].copy()
+    _merge_ad_pair(merged, ads[1])
+
+    assert merged['end'] == 160.0
+    assert 'end_extended_by_content' not in merged
+
+
+def test_merge_preserves_content_extension_on_later_fragment():
+    ads = [
+        {
+            'start': 100.0,
+            'end': 130.0,
+            'confidence': 0.9,
+            'reason': 'Sponsor ad part one',
+        },
+        {
+            'start': 132.0,
+            'end': 160.0,
+            'confidence': 0.9,
+            'reason': 'Sponsor ad part two',
+            'end_extended_by_content': True,
+        },
+    ]
+
+    merged = ads[0].copy()
+    _merge_ad_pair(merged, ads[1])
+
+    assert merged['end_extended_by_content'] is True

@@ -1643,6 +1643,9 @@ def _apply_reviewer_verdict_to_ad(ad, v):
     if v.verdict == 'adjust':
         ad['reviewer_original_start'] = v.original_start
         ad['reviewer_original_end'] = v.original_end
+        if v.adjusted_end != ad.get('end'):
+            ad.pop('end_extended_by_content', None)
+            ad.pop('tail_splice_snap', None)
         ad['start'] = v.adjusted_start
         ad['end'] = v.adjusted_end
     elif v.verdict == 'reject':
@@ -1904,6 +1907,82 @@ def _snap_completed_cut_tails_to_splice(
     if changed:
         storage.save_combined_ads(slug, episode_id, all_ads_with_validation)
     return snapped
+
+
+def _finalize_user_confirmed_bounds(
+        slug, episode_id, ads_to_remove, all_ads_with_validation,
+        confirmed_corrections=None, episode_duration=None):
+    """Make a human-approved trim the final authority before audio cutting.
+
+    Validation normally applies ``confirmed_span`` already, but later pipeline
+    stages rebuild marker dicts and mutate boundaries. Re-assert the approved
+    span after every reviewer/tail operation and synchronize the master marker
+    so the rendered cut and UI audit trail cannot diverge.
+    """
+    if not ads_to_remove:
+        return ads_to_remove
+    corrections = (confirmed_corrections if confirmed_corrections is not None
+                   else db.get_confirmed_corrections(episode_id))
+    def matching_correction(marker):
+        for corr in corrections or []:
+            ratio = overlap_ratio(
+                corr['start'], corr['end'], marker['start'], marker['end'])
+            if ratio >= CORRECTION_MATCH_MIN_COVERAGE:
+                return corr
+        return None
+
+    def approved_span(marker):
+        validation = marker.get('validation') or {}
+        if not validation.get('user_confirmed'):
+            return None
+        carried = validation.get('confirmed_span')
+        if isinstance(carried, dict):
+            return carried
+        correction = matching_correction(marker)
+        if correction is None:
+            return None
+        return correction.get('confirmed_span')
+
+    def apply_span(marker, approved):
+        target_start = max(0.0, float(approved['start']))
+        target_end = float(approved['end'])
+        if episode_duration is not None and episode_duration > 0:
+            target_end = min(target_end, float(episode_duration))
+        if target_end <= target_start:
+            return False
+        old_start, old_end = marker['start'], marker['end']
+        if old_end != target_end:
+            marker.pop('end_extended_by_content', None)
+            marker.pop('tail_splice_snap', None)
+        marker['start'], marker['end'] = target_start, target_end
+        clip_dai_core_spans(marker, target_start, target_end)
+        flags = (marker.get('validation') or {}).get('flags')
+        if isinstance(flags, list):
+            note = 'INFO: Finalized to user-approved span'
+            if note not in flags:
+                flags.append(note)
+        return (old_start, old_end) != (target_start, target_end)
+
+    changed = False
+    for ad in ads_to_remove:
+        approved = approved_span(ad)
+        if approved is None:
+            continue
+        # Resolve the master before changing the cut-list key. A separate copy
+        # may already have drifted, so fall back to the same carried approval.
+        master = _find_master(all_ads_with_validation, ad)
+        if master is None:
+            master = next((
+                candidate for candidate in all_ads_with_validation
+                if approved_span(candidate) == approved
+            ), None)
+        changed = apply_span(ad, approved) or changed
+        if master is not None and master is not ad:
+            changed = apply_span(master, approved) or changed
+
+    if changed:
+        storage.save_combined_ads(slug, episode_id, all_ads_with_validation)
+    return ads_to_remove
 
 
 def _apply_pass2_heuristic_rolls(slug, episode_id, verification_ads_processed,
@@ -3281,7 +3360,7 @@ def _apply_boundary_adjustments(slug, episode_id, all_ads):
     corrections = db.get_episode_corrections(episode_id) or []
     adjusted = set()
     applied = 0
-    for c in corrections:  # newest first (ORDER BY created_at DESC)
+    for c in corrections:  # newest first (ORDER BY id DESC)
         if c.get('correction_type') != 'boundary_adjustment':
             continue
         orig = c.get('original_bounds') or {}
@@ -4237,6 +4316,13 @@ def process_episode(slug: str, episode_id: str, episode_url: str,
                 slug, episode_id, ads_to_remove, all_ads_with_validation,
                 segments, audio_analysis_result, podcast_name=podcast_name
             )
+
+            # Human-approved trim bounds are the final boundary authority.
+            # Run after every automated reviewer and tail mutation so neither
+            # the audio cut nor its persisted marker can drift from approval.
+            ads_to_remove = _finalize_user_confirmed_bounds(
+                slug, episode_id, ads_to_remove, all_ads_with_validation,
+                episode_duration=episode_duration)
 
             # Backstop: the late keep partition above should already have
             # caught everything, so this normally finds nothing.

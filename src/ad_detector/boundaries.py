@@ -810,6 +810,13 @@ def _merge_ad_pair(current_ad: Dict, next_ad: Dict, gap_desc: str = "") -> None:
     """
     mark_distinct_merge(current_ad, next_ad)
     current_ad['end'] = next_ad['end']
+    # The tail-sweep marker describes how the *current end* was reached. Once
+    # this merge replaces that edge, only the later fragment's flag remains
+    # meaningful; retaining the earlier fragment's flag could snap past an
+    # otherwise final, non-content-derived boundary.
+    current_ad.pop('end_extended_by_content', None)
+    if next_ad.get('end_extended_by_content'):
+        current_ad['end_extended_by_content'] = True
     current_ad['confidence'] = max(current_ad.get('confidence', 0.0),
                                    next_ad.get('confidence', 0.0))
 
@@ -1458,11 +1465,26 @@ def _span_blocked_by_content(segments: List[Dict], ads: List[Dict],
         text = (seg.get('text') or '').strip()
         if not text:
             continue
-        covered = any(
-            ranges_overlap(seg_start, seg_end, m['start'], m['end'])
-            for m in ads
-            if m.get('start') is not None and m.get('end') is not None
-        )
+        # Only coverage inside the proposed extension matters. A long
+        # transcript segment may continue into a later marker after the
+        # candidate splice; that must not hide show speech before the splice.
+        relevant_start = max(seg_start, span_start)
+        relevant_end = min(seg_end, span_end)
+        covered_until = relevant_start
+        for marker in sorted(
+                (m for m in ads
+                 if m.get('start') is not None and m.get('end') is not None),
+                key=lambda m: m['start']):
+            marker_start = max(marker['start'], relevant_start)
+            marker_end = min(marker['end'], relevant_end)
+            if marker_end <= covered_until:
+                continue
+            if marker_start > covered_until:
+                break
+            covered_until = marker_end
+            if covered_until >= relevant_end:
+                break
+        covered = covered_until >= relevant_end
         if covered or _text_has_ad_content(text.lower(), ad_sponsors):
             continue
         return True

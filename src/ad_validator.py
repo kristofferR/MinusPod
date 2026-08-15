@@ -338,20 +338,16 @@ class AdValidator:
                             overlap_threshold: float = CORRECTION_MATCH_MIN_COVERAGE) -> Optional[Dict]:
         """Return a user-confirmed correction covering >= threshold of the
         range, or None. Mirrors _overlaps_confirmed but yields the match so
-        the caller can honor a trimmed approval's confirmed_span. A trimmed
-        approval wins over a plain confirm covering the same range -- it is
-        the more specific user intent and must not be shadowed."""
+        the caller can honor an exact ``confirmed_span``. Corrections arrive
+        newest first, so the latest overlapping user decision is authoritative.
+        """
         segment_duration = end - start
         if segment_duration < 0.001:
             return None
-        plain = None
         for corr in self.confirmed_corrections:
             if overlap_ratio(corr['start'], corr['end'], start, end) >= overlap_threshold:
-                if corr.get('confirmed_span'):
-                    return corr
-                if plain is None:
-                    plain = corr
-        return plain
+                return corr
+        return None
 
     def validate(self, ads: List[Dict],
                  audio_analysis: Optional[Dict] = None,
@@ -382,6 +378,21 @@ class AdValidator:
         # this staying shallow: _validate_verification_ads attaches an
         # _orig_twin reference that must survive into the validated output.
         ads = [ad.copy() for ad in ads]
+
+        # Human false-positive decisions apply to the detected span the user
+        # actually reviewed. Preserve that match before measured DAI bounds
+        # restore portions removed by an automatic snap. Keep matching and
+        # non-matching markers separate so a nearby real ad is not rejected
+        # as collateral damage during the tiny-gap merge below.
+        for ad in ads:
+            ad['_matches_false_positive_correction'] = (
+                self._overlaps_false_positive(ad['start'], ad['end']))
+            core_start, core_end = dai_core_bounds(ad)
+            if ((core_start is not None and core_start < ad['start'])
+                    or (core_end is not None and core_end > ad['end'])):
+                confirmed = self._matching_confirmed(ad['start'], ad['end'])
+                if confirmed is not None:
+                    ad['_pre_dai_restore_confirmed_correction'] = confirmed
 
         # Step 1: Auto-correct boundaries
         ads = self._clamp_boundaries(ads, result)
@@ -445,8 +456,16 @@ class AdValidator:
         duration = ad['end'] - ad['start']
         position = ad['start'] / self.episode_duration if self.episode_duration > 0 else 0
 
-        # Check for user-marked false positives first (highest priority)
-        if self._overlaps_false_positive(ad['start'], ad['end']):
+        # Check for user-marked false positives first (highest priority).
+        # The internal flag records a match before DAI-core restoration; pop
+        # it so validation-only bookkeeping is never persisted or returned.
+        matched_false_positive = ad.pop(
+            '_matches_false_positive_correction', False)
+        pre_restore_confirmed = ad.pop(
+            '_pre_dai_restore_confirmed_correction', None)
+        matched_before_dai_restore = pre_restore_confirmed is not None
+        if (matched_false_positive
+                or self._overlaps_false_positive(ad['start'], ad['end'])):
             flags.append("INFO: User marked as false positive")
             logger.info(
                 f"Auto-rejecting segment {ad['start']:.1f}s-{ad['end']:.1f}s: "
@@ -463,7 +482,8 @@ class AdValidator:
             return ad
 
         # Check for user-confirmed corrections (second priority)
-        confirmed = self._matching_confirmed(ad['start'], ad['end'])
+        confirmed = (pre_restore_confirmed
+                     or self._matching_confirmed(ad['start'], ad['end']))
         if confirmed is not None:
             # A trimmed approval confirmed only a sub-span as ad. Pull a
             # boundary inward only when it falls in a trimmed-out zone (inside
@@ -475,10 +495,29 @@ class AdValidator:
             auto_accept = True
             if span:
                 new_start, new_end = ad['start'], ad['end']
-                if confirmed['start'] <= new_start < span['start']:
-                    new_start = span['start']
-                if span['end'] < new_end <= confirmed['end']:
-                    new_end = span['end']
+                approved_start = max(0.0, span['start'])
+                approved_end = span['end']
+                if self.episode_duration > 0:
+                    approved_end = min(approved_end, self.episode_duration)
+                overlaps_approved = (
+                    new_start < approved_end and new_end > approved_start)
+                if matched_before_dai_restore:
+                    # This correction matched the narrower span before a
+                    # persisted DAI core widened it. The confirmed span is
+                    # therefore authoritative over every restored edge.
+                    new_start = max(new_start, approved_start)
+                    new_end = min(new_end, approved_end)
+                else:
+                    if confirmed['start'] <= new_start < approved_start:
+                        new_start = approved_start
+                    if approved_end < new_end <= confirmed['end']:
+                        new_end = approved_end
+                    if overlaps_approved:
+                        # Every part of confirmed_span was explicitly approved
+                        # as ad audio. A later narrower detection must not
+                        # leave part of that known-positive span behind.
+                        new_start = min(new_start, approved_start)
+                        new_end = max(new_end, approved_end)
                 if new_end <= new_start:
                     # The detection lies entirely inside user-kept content;
                     # do not auto-accept -- let normal validation judge it.
@@ -497,19 +536,50 @@ class AdValidator:
                     # later widen the marker back into user-kept content.
                     clip_dai_core_spans(ad, new_start, new_end)
             if auto_accept:
+                approved = span or confirmed
+                tolerance = 0.01
+                fully_authorized = (
+                    ad['start'] >= approved['start'] - tolerance
+                    and ad['end'] <= approved['end'] + tolerance
+                )
+                if not fully_authorized:
+                    # A new detection may extend beyond the confirmed ad even
+                    # without merge bookkeeping. Judge that wider marker
+                    # normally; the human approved only a subset.
+                    auto_accept = False
+                    flags.append(
+                        "INFO: User confirmation covers only part of segment")
+            if auto_accept:
                 flags.append("INFO: User confirmed as ad")
                 logger.info(
                     f"Auto-accepting segment {ad['start']:.1f}s-{ad['end']:.1f}s: "
                     f"overlaps with user-confirmed correction"
                 )
-                ad['validation'] = {
+                validation = {
                     'decision': Decision.ACCEPT.value,
                     'adjusted_confidence': 1.0,
                     'original_confidence': ad.get('confidence', 1.0),
+                    # Nested under the validator-owned result so an arbitrary
+                    # detector/model field cannot forge this trust signal.
+                    'user_confirmed': True,
                     'flags': flags,
                     'corrections': corrections
                 }
+                if span:
+                    # Carry the exact approved bounds through late reviewer
+                    # and tail mutations. Re-matching against a marker after
+                    # it has grown can fall below the correction overlap
+                    # threshold and lose the user's trim.
+                    validation['confirmed_span'] = {
+                        'start': approved_start,
+                        'end': approved_end,
+                    }
+                ad['validation'] = validation
                 return ad
+            duration = ad['end'] - ad['start']
+            position = (
+                ad['start'] / self.episode_duration
+                if self.episode_duration > 0 else 0)
 
         # Duration checks
         if duration < MIN_AD_DURATION:
@@ -1062,7 +1132,11 @@ class AdValidator:
             if (bool(last.get('differential_uncorroborated'))
                     != bool(current.get('differential_uncorroborated'))
                     or bool(last.get('held_for_review'))
-                    != bool(current.get('held_for_review'))):
+                    != bool(current.get('held_for_review'))
+                    or last.get('_pre_dai_restore_confirmed_correction') is not None
+                    or current.get('_pre_dai_restore_confirmed_correction') is not None
+                    or bool(last.get('_matches_false_positive_correction'))
+                    != bool(current.get('_matches_false_positive_correction'))):
                 merged.append(current.copy())
                 continue
 

@@ -94,9 +94,14 @@ REVIEWER_AFFIRMATION_PATTERNS = (
     r'dynamically\s+inserted\s+)?ad(?:vertisement)?(?!-)\b',
     r'\bare\s+(?:all\s+)?(?:genuine\s+|real\s+)?ads(?!-)\b',
     r'\bis\s+(?:genuine\s+|real\s+|paid\s+)?advertising\b',
+    # Elliptical reviewer prose often begins with the classification rather
+    # than a verb: "Multiple Norwegian ads ... adjusted start to exclude ...".
+    # This is still an explicit affirmation when paired with trim language.
+    r'^(?:multiple|several)\s+(?:[\w-]+\s+){0,2}ads?(?!-)\b',
 )
 
 _AFFIRMATION_RES = tuple(re.compile(p) for p in REVIEWER_AFFIRMATION_PATTERNS)
+_ELLIPTICAL_AFFIRMATION_RE = _AFFIRMATION_RES[-1]
 
 # Trim-language precheck: only spend the recovery LLM call when the
 # reasoning describes a sub-span trim; plain "not an ad" skips it.
@@ -134,7 +139,23 @@ def reasoning_affirms_ad(reasoning: Optional[str]) -> bool:
     if not reasoning:
         return False
     lowered = reasoning.lower()
-    return any(r.search(lowered) for r in _AFFIRMATION_RES)
+    for regex in _AFFIRMATION_RES:
+        match = regex.search(lowered)
+        if not match:
+            continue
+        if regex is _ELLIPTICAL_AFFIRMATION_RE:
+            tail = lowered[match.end():]
+            contradiction_positions = [
+                found.start()
+                for contradiction in _CONTRADICTION_RES
+                if (found := contradiction.search(tail)) is not None
+            ]
+            if contradiction_positions:
+                trim = _TRIM_LANGUAGE_RE.search(tail)
+                if trim is None or min(contradiction_positions) < trim.start():
+                    continue
+        return True
+    return False
 
 
 def reasoning_contradicts_cut(reasoning: Optional[str]) -> bool:
@@ -165,6 +186,12 @@ def _adjusted_ad_copy(ad: Dict, start: float, end: float,
     updated = dict(ad)
     updated["start"] = start
     updated["end"] = end
+    if end != ad.get("end"):
+        # Content-tail provenance describes how the old edge was reached.
+        # A reviewer-selected end must earn any later sonic-tail extension
+        # from fresh content evidence instead of reusing stale eligibility.
+        updated.pop("end_extended_by_content", None)
+        updated.pop("tail_splice_snap", None)
     updated["reviewer_verdict"] = "adjust"
     updated["reviewer_original_start"] = original_start
     updated["reviewer_original_end"] = original_end
@@ -670,6 +697,15 @@ class AdReviewer:
             max_workers=parallel_ads,
         )
         for verdict, updated_ad in accepted_results:
+            # Human corrections are the highest-confidence signal. They are
+            # deliberately omitted from the reviewer call and retain their
+            # validated bounds and cut decision unchanged. Do not synthesize
+            # a ReviewVerdict here: ad_reviewer_log and its totalReviews stat
+            # count actual LLM calls. The persisted validation.user_confirmed
+            # field is the audit record for this human-authorized bypass.
+            if verdict is None:
+                result.accepted_after_review.append(updated_ad)
+                continue
             result.verdicts.append(verdict)
             if verdict.verdict == "reject":
                 marked = dict(updated_ad)
@@ -812,6 +848,9 @@ class AdReviewer:
             return []
 
         def _run_one(idx):
+            if (pool == "accepted"
+                    and (ads[idx].get("validation") or {}).get("user_confirmed")):
+                return None, ads[idx]
             return self._review_single(
                 ad=ads[idx],
                 pool=pool,

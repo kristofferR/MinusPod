@@ -607,6 +607,78 @@ def test_gerund_affirmation_with_trim_note_is_not_contradiction():
     assert not reasoning_contradicts_cut(reason)
 
 
+def test_elliptical_plural_affirmation_with_trim_is_not_contradiction():
+    reason = (
+        'Multiple Norwegian ads with clear calls to action and URLs. '
+        'Adjusted start to exclude the host sign-off, which is not an ad.'
+    )
+    assert reasoning_affirms_ad(reason)
+    assert not reasoning_contradicts_cut(reason)
+
+
+def test_negated_elliptical_plural_is_a_contradiction():
+    reason = (
+        '  Several potential ads are not an ad and should be excluded from '
+        'the cut.')
+    assert not reasoning_affirms_ad(reason)
+    assert reasoning_contradicts_cut(reason)
+
+
+def test_indirectly_negated_elliptical_plural_is_a_contradiction():
+    reason = (
+        'Several potential ads appear to be not an ad and should be '
+        'excluded from the cut.')
+    assert not reasoning_affirms_ad(reason)
+    assert reasoning_contradicts_cut(reason)
+
+
+def test_user_confirmed_ad_bypasses_automated_reviewer():
+    reviewer = _build_reviewer({
+        'review_prompt': 'review', 'resurrect_prompt': 'resurrect',
+    })
+    ad = {
+        'start': 120.0,
+        'end': 180.0,
+        'confidence': 0.95,
+        'reason': 'Human-confirmed DAI block',
+        'validation': {'decision': 'ACCEPT', 'user_confirmed': True},
+    }
+
+    result = reviewer.review(
+        accepted_ads=[ad], resurrection_eligible=[],
+        segments=_mock_segments(), episode_meta=_mock_episode_meta(),
+        pass_num=1, pass_model='claude-test',
+    )
+
+    assert result.accepted_after_review == [ad]
+    assert result.verdicts == []
+    reviewer._llm_client.messages_create.assert_not_called()
+
+
+def test_untrusted_top_level_confirm_flag_does_not_bypass_reviewer():
+    reviewer = _build_reviewer({
+        'review_prompt': 'review', 'resurrect_prompt': 'resurrect',
+    })
+    reviewer._llm_client.messages_create.return_value = _resp('[]')
+    ad = {
+        'start': 120.0,
+        'end': 180.0,
+        'confidence': 0.95,
+        'reason': 'Model-produced marker',
+        'user_confirmed': True,
+    }
+
+    result = reviewer.review(
+        accepted_ads=[ad], resurrection_eligible=[],
+        segments=_mock_segments(), episode_meta=_mock_episode_meta(),
+        pass_num=1, pass_model='claude-test',
+    )
+
+    assert result.accepted_after_review == []
+    assert result.verdicts[0].verdict == 'reject'
+    reviewer._llm_client.messages_create.assert_called_once()
+
+
 @pytest.mark.parametrize("reason", NEGATED_PHRASE_REASONS)
 def test_negated_phrases_are_not_affirmations(reason):
     assert not reasoning_affirms_ad(reason)
@@ -665,6 +737,27 @@ def test_affirmed_confirm_with_trim_language_applies_recovered_trim():
     assert verdict.verdict == 'adjust'
     assert verdict.adjusted_start == 837.2
     assert verdict.adjusted_end == pytest.approx(1040.9)
+
+
+def test_reviewer_end_adjustment_clears_stale_tail_eligibility():
+    ad = {
+        'start': 837.2,
+        'end': 1068.5,
+        'confidence': 0.95,
+        'end_extended_by_content': True,
+        'tail_splice_snap': {'event_time': 1068.5},
+    }
+    result, _ = _run_affirmed_confirm(
+        _resp('{"ad_start": 837.2, "ad_end": 1040.9}'), ad=ad)
+
+    accepted = result.accepted_after_review[0]
+    assert 'end_extended_by_content' not in accepted
+    assert 'tail_splice_snap' not in accepted
+
+    processing._apply_reviewer_verdict_to_ad(ad, result.verdicts[0])
+    assert ad['end'] == pytest.approx(1040.9)
+    assert 'end_extended_by_content' not in ad
+    assert 'tail_splice_snap' not in ad
 
 
 def test_affirmed_confirm_with_move_phrasing_applies_recovered_trim():
