@@ -36,6 +36,7 @@ from utils.time import (
 from verification_pass import _build_timestamp_map, _map_correction_to_processed, _map_to_original
 from config import (
     MIN_CUT_CONFIDENCE, MAX_EPISODE_RETRIES,
+    MIN_AD_DURATION_FOR_REMOVAL,
     MIN_CONTENT_BETWEEN_ADS_SECONDS,
     AUDIO_CUE_PAIR_CONFIDENCE, AUDIO_CUE_PAIR_ORIENT_WINDOW_SECONDS,
     CORRECTION_MATCH_MIN_COVERAGE,
@@ -1282,6 +1283,206 @@ def _stamp_pass2_marker_categories(markers):
     return markers
 
 
+def _partition_pass2_category_actions(processed_ads, original_ads, actions_map):
+    """Apply the feed's category actions to paired pass-2 candidates.
+
+    Pass 2 has parallel processed/original coordinate lists, so its keep
+    partition cannot reuse the single-list pass-1 helper. Kept candidates are
+    removed from both detection lists before validation and reviewer routing;
+    both coordinate copies are returned so the processed marker can protect a
+    kept tail from the validator's end-of-episode extension while the original
+    marker is persisted. Remaining candidates remain unstamped until confidence
+    gating and review decide which ones the recut will actually render.
+
+    Returns ``(remaining_processed, remaining_original, kept_processed,
+    kept_original)``.
+    """
+    remaining_processed = []
+    remaining_original = []
+    kept_processed = []
+    kept_original = []
+    if len(processed_ads) != len(original_ads):
+        raise ValueError(
+            'Pass-2 processed/original marker lists must stay paired')
+    for processed, original in zip(processed_ads, original_ads):
+        category = normalize_segment_category(
+            processed.get('category', original.get('category')))
+        action = actions_map.get(category, DEFAULT_SEGMENT_ACTION)
+        pattern_defined = bool(
+            processed.get('pattern_defined') or original.get('pattern_defined'))
+        if action == 'keep' and not pattern_defined:
+            for marker in (processed, original):
+                marker['was_cut'] = False
+                marker['action_applied'] = 'keep'
+                if marker.get('held_for_review'):
+                    marker['hold_cleared_reason'] = marker.get('hold_reason')
+                    marker['held_for_review'] = False
+                    marker.pop('hold_reason', None)
+            kept_processed.append(processed)
+            kept_original.append(original)
+            continue
+
+        if action == 'keep':
+            processed['keep_overridden_by_pattern'] = True
+            original['keep_overridden_by_pattern'] = True
+        remaining_processed.append(processed)
+        remaining_original.append(original)
+
+    return (remaining_processed, remaining_original,
+            kept_processed, kept_original)
+
+
+def _split_pass2_candidates_around_spans(processed_ads, original_ads,
+                                          barriers_processed, pass1_cuts,
+                                          barrier_label):
+    """Split paired pass-2 candidates around protected processed spans."""
+    if not barriers_processed:
+        return processed_ads, original_ads
+    if len(processed_ads) != len(original_ads):
+        raise ValueError(
+            'Pass-2 processed/original marker lists must stay paired')
+
+    barriers = sorted(
+        ((marker['start'], marker['end']) for marker in barriers_processed),
+        key=lambda span: span[0],
+    )
+    timestamp_map = _build_timestamp_map(pass1_cuts)
+    replacement_duration = get_replacement_duration()
+    surviving_processed = []
+    surviving_original = []
+
+    for processed, original in zip(processed_ads, original_ads):
+        fragments = [(processed['start'], processed['end'])]
+        for barrier_start, barrier_end in barriers:
+            next_fragments = []
+            for start, end in fragments:
+                if barrier_end <= start or barrier_start >= end:
+                    next_fragments.append((start, end))
+                    continue
+                if start < barrier_start:
+                    next_fragments.append((start, barrier_start))
+                if barrier_end < end:
+                    next_fragments.append((barrier_end, end))
+            fragments = next_fragments
+
+        if fragments == [(processed['start'], processed['end'])]:
+            surviving_processed.append(processed)
+            surviving_original.append(original)
+            continue
+
+        audio_logger.info(
+            f"Pass-2 candidate {processed['start']:.1f}s-"
+            f"{processed['end']:.1f}s split around {barrier_label} into "
+            f"{len(fragments)} removable fragment(s)")
+        for start, end in fragments:
+            fragment_processed = dict(processed, start=start, end=end)
+            if (processed.get('_trusted_split_fragment')
+                    or processed['end'] - processed['start']
+                    >= MIN_AD_DURATION_FOR_REMOVAL):
+                # The parent cleared the renderer's duration floor before a
+                # protected keep/beep span carved it into smaller pieces.
+                # Validation still decides whether each piece is a cut.
+                fragment_processed['_trusted_split_fragment'] = True
+            fragment_original = dict(
+                original,
+                start=_map_to_original(
+                    start, timestamp_map, replacement_duration),
+                end=_map_to_original(
+                    end, timestamp_map, replacement_duration),
+            )
+            surviving_processed.append(fragment_processed)
+            surviving_original.append(fragment_original)
+
+    return surviving_processed, surviving_original
+
+
+def _exclude_category_kept_spans(processed_ads, original_ads,
+                                  kept_processed, pass1_cuts):
+    """Subtract category-kept pass-2 spans from remaining candidates.
+
+    Heuristic roll detection can overlap an LLM marker whose category action
+    is keep. Split the candidate on the processed timeline, then remap each
+    surviving fragment to original coordinates so validation, recutting, and
+    the UI retain paired markers without cutting through the kept audio.
+    """
+    return _split_pass2_candidates_around_spans(
+        processed_ads, original_ads, kept_processed, pass1_cuts,
+        'category-kept audio')
+
+
+def _pass2_keep_barriers_processed(pass1_kept_markers, pass1_cuts,
+                                    category_kept_processed=None):
+    """Collect every keep marker on the pass-1 processed timeline."""
+    replacement_duration = get_replacement_duration()
+    pass1_processed = [
+        dict(
+            marker,
+            start=adjust_timestamp(
+                marker['start'], pass1_cuts, replacement_duration),
+            end=adjust_timestamp(
+                marker['end'], pass1_cuts, replacement_duration),
+        )
+        for marker in pass1_kept_markers or []
+    ]
+    return [*pass1_processed, *(category_kept_processed or [])]
+
+
+def _stamp_pass2_cut_actions(processed_cuts, original_cuts, actions_map):
+    """Stamp remove/beep only after pass-2 candidates become actual cuts.
+
+    Validation and review may still divert a candidate into a hold or reject
+    it. Delaying the stamp keeps those uncut markers from advertising a cut
+    seam or replacement range to downstream chapter generation.
+    """
+    for marker in [*processed_cuts, *original_cuts]:
+        category = normalize_segment_category(marker.get('category'))
+        action = actions_map.get(category, DEFAULT_SEGMENT_ACTION)
+        if action not in ('remove', 'beep'):
+            action = DEFAULT_SEGMENT_ACTION
+        marker['action_applied'] = action
+
+
+def _reconcile_pass2_cut_actions(processed_cuts, original_cuts, pass1_cuts):
+    """Make actual pass-2 cuts disjoint when their render actions differ.
+
+    A beep preserves timeline duration while remove shrinks it, so overlapping
+    spans cannot both reach ffmpeg. Beep is explicit protected replacement
+    intent: split remove candidates around the beep spans, then restore a
+    time-ordered paired list for recutting and UI persistence.
+    """
+    if len(processed_cuts) != len(original_cuts):
+        raise ValueError(
+            'Pass-2 processed/original cut lists must stay paired')
+
+    beep_pairs = [
+        (processed, original)
+        for processed, original in zip(processed_cuts, original_cuts)
+        if processed.get('action_applied') == 'beep'
+    ]
+    if not beep_pairs:
+        return processed_cuts, original_cuts
+    remove_pairs = [
+        (processed, original)
+        for processed, original in zip(processed_cuts, original_cuts)
+        if processed.get('action_applied') != 'beep'
+    ]
+    remove_processed, remove_original = (
+        [pair[0] for pair in remove_pairs],
+        [pair[1] for pair in remove_pairs],
+    )
+    remove_processed, remove_original = _split_pass2_candidates_around_spans(
+        remove_processed,
+        remove_original,
+        [pair[0] for pair in beep_pairs],
+        pass1_cuts,
+        'beep-replacement audio',
+    )
+    reconciled = [*beep_pairs, *zip(remove_processed, remove_original)]
+    reconciled.sort(key=lambda pair: pair[0]['start'])
+    return ([pair[0] for pair in reconciled],
+            [pair[1] for pair in reconciled])
+
+
 def _refine_and_validate(slug, episode_id, all_ads, segments, audio_path,
                           episode_description, episode_duration, min_cut_confidence,
                           podcast_name, skip_patterns=False, positional_prior=None,
@@ -1882,7 +2083,9 @@ def _validate_verification_ads(slug, episode_id, verification_ads_processed,
                                 min_cut_confidence, db,
                                 processed_duration=None,
                                 max_ad_duration_override=None,
-                                cue_gate_enabled=False, podcast_id=None):
+                                cue_gate_enabled=False, podcast_id=None,
+                                segment_actions=None,
+                                keep_barriers_processed=None):
     """Validate pass-2 ad candidates against processed-coordinate validator.
 
     Maps pass-1 user FP corrections from original to processed coordinates,
@@ -1896,6 +2099,11 @@ def _validate_verification_ads(slug, episode_id, verification_ads_processed,
     verification ads can never carry cue evidence (snap is pass-1 only), so on
     a cue-gated feed every pass-2 proposal will be held -- intended conservative
     behavior.
+
+    ``keep_barriers_processed`` contains category-kept pass-2 markers removed
+    from the cut candidates. Validator-only copies stay in the ordered span
+    list so a removable candidate before a kept tail cannot be extended through
+    that tail to the end of the episode.
 
     Returns (verification_ads_processed, verification_ads_original).
     """
@@ -1945,7 +2153,16 @@ def _validate_verification_ads(slug, episode_id, verification_ads_processed,
     for proc, orig in zip(verification_ads_processed, verification_ads_original):
         proc['_orig_twin'] = orig
 
-    v_validation = v_validator.validate(verification_ads_processed)
+    validation_input = list(verification_ads_processed)
+    for marker in keep_barriers_processed or []:
+        barrier = marker.copy()
+        barrier['_pass2_keep_barrier'] = True
+        # Also prevent a merge when validation is called without an action map.
+        barrier['held_for_review'] = True
+        validation_input.append(barrier)
+
+    v_validation = v_validator.validate(
+        validation_input, actions_map=segment_actions)
 
     # validate() worked on copies; strip the key from the input dicts too so
     # no later consumer of the raw verification result can serialize it.
@@ -1954,6 +2171,8 @@ def _validate_verification_ads(slug, episode_id, verification_ads_processed,
 
     kept_processed, kept_original = [], []
     for ad in v_validation.ads:
+        if ad.pop('_pass2_keep_barrier', False):
+            continue
         # Strip the pairing key from every validator output (rejected ones
         # included) so it can never leak into serialized payloads.
         orig = ad.pop('_orig_twin', None)
@@ -2054,11 +2273,10 @@ def _exclude_kept_spans_from_verification(verification_ads_processed,
     """
     if not pass1_kept_markers:
         return verification_ads_processed, verification_ads_original, []
-    replacement_duration = get_replacement_duration()
     kept_spans_processed = [
-        (adjust_timestamp(m['start'], pass1_cuts, replacement_duration),
-         adjust_timestamp(m['end'], pass1_cuts, replacement_duration))
-        for m in pass1_kept_markers
+        (marker['start'], marker['end'])
+        for marker in _pass2_keep_barriers_processed(
+            pass1_kept_markers, pass1_cuts)
     ]
     surviving_processed = []
     surviving_original = []
@@ -2330,7 +2548,8 @@ def _pass2_cuts_in_original(recut_applied, pass1_cuts):
 
 
 def _recut_processed_audio(slug, episode_id, processed_path, v_ads_to_cut,
-                            local_audio_processor):
+                            local_audio_processor,
+                            cut_barriers=None):
     """Re-cut the pass-1 processed audio with verification ads.
 
     Returns (processed_path, recut_applied, recut_ok) where recut_applied is
@@ -2342,7 +2561,9 @@ def _recut_processed_audio(slug, episode_id, processed_path, v_ads_to_cut,
     # instead of silently falling back to a full remove.
     audio_segments = [dict(ad, beep=(ad.get('action_applied') == 'beep'))
                       for ad in v_ads_to_cut]
-    recut_result = local_audio_processor.process_episode(processed_path, audio_segments)
+    recut_result = local_audio_processor.process_episode(
+        processed_path, audio_segments,
+        cut_barriers=cut_barriers)
     if recut_result:
         recut_path, recut_applied = recut_result
         if os.path.exists(processed_path):
@@ -2381,6 +2602,10 @@ def _drop_uncovered_pass2_ads(slug, episode_id, v_ads_to_cut, v_ads_for_ui,
     """
     twin = {id(p): o for p, o in zip(verification_ads_processed,
                                      verification_ads_original)}
+    # Action reconciliation can replace a candidate with split copies after
+    # validation. Prefer the final cut/UI pairing so a short split fragment
+    # filtered by AudioProcessor also removes its exact UI marker.
+    twin.update({id(p): o for p, o in zip(v_ads_to_cut, v_ads_for_ui)})
     for ad in [a for a in v_ads_to_cut
                if not _covered_by_cuts(a, recut_applied, total_duration)]:
         v_ads_to_cut.remove(ad)
@@ -2404,7 +2629,7 @@ def _run_verification_pass(ctx, processed_path, pass1_cuts,
                             original_segments=None, reuse_transcript=False,
                             max_ad_duration_override=None, cue_gate_enabled=False,
                             pass1_held_markers=None, pass1_kept_markers=None,
-                            skip_verification=False):
+                            skip_verification=False, segment_actions=None):
     """Pipeline stage: Run verification (second pass) on processed audio.
 
     ``pass1_cuts`` must be the cuts ffmpeg actually applied (see
@@ -2445,6 +2670,8 @@ def _run_verification_pass(ctx, processed_path, pass1_cuts,
     verification_cue_count = 0
     v_corroborated_count = 0
     clear_fallback(episode_id, PASS_AD_DETECTION_2)
+    if segment_actions is None:
+        segment_actions = db.resolve_segment_actions(slug)
 
     # Read once per verification pass: standalone-miss hold/autocut floors
     # for _gate_verification_ads_by_confidence (registry defaults when unset).
@@ -2500,6 +2727,47 @@ def _run_verification_pass(ctx, processed_path, pass1_cuts,
             pass1_cuts, podcast_name, skip_patterns,
         )
 
+        # A pass-1 keep is operator intent. Divert overlaps before category
+        # partitioning so a same-category keep does not become a duplicate
+        # pass-2 marker and no conflicting finding can reach validation.
+        (verification_ads_processed,
+         verification_ads_original,
+         kept_conflicts) = _exclude_kept_spans_from_verification(
+            verification_ads_processed,
+            verification_ads_original,
+            pass1_kept_markers,
+            pass1_cuts,
+        )
+
+        (verification_ads_processed,
+         verification_ads_original,
+         category_kept_processed,
+         category_kept) = _partition_pass2_category_actions(
+            verification_ads_processed,
+            verification_ads_original,
+            segment_actions,
+        )
+        if category_kept:
+            v_ads_held.extend(category_kept)
+            audio_logger.info(
+                f"[{slug}:{episode_id}] Verification kept "
+                f"{len(category_kept)} segment(s) by category action"
+            )
+
+        (verification_ads_processed,
+         verification_ads_original) = _exclude_category_kept_spans(
+            verification_ads_processed,
+            verification_ads_original,
+            category_kept_processed,
+            pass1_cuts,
+        )
+        keep_barriers_processed = _pass2_keep_barriers_processed(
+            pass1_kept_markers,
+            pass1_cuts,
+            category_kept_processed,
+        )
+
+        had_verification_candidates = bool(verification_ads_processed)
         if verification_ads_processed:
             audio_logger.info(f"[{slug}:{episode_id}] Verification found {len(verification_ads_processed)} missed ads")
 
@@ -2520,23 +2788,21 @@ def _run_verification_pass(ctx, processed_path, pass1_cuts,
                     max_ad_duration_override=max_ad_duration_override,
                     cue_gate_enabled=cue_gate_enabled,
                     podcast_id=ctx.podcast_id,
+                    segment_actions=segment_actions,
+                    keep_barriers_processed=keep_barriers_processed,
                 )
 
-            # Kept-span exclusion: must run before any finding is routed to
-            # a cut, a hold, or a dropped-miss log line.
-            verification_ads_processed, verification_ads_original, kept_conflicts = _exclude_kept_spans_from_verification(
-                verification_ads_processed, verification_ads_original,
-                pass1_kept_markers, pass1_cuts,
-            )
             if verification_ads_processed:
                 # Confidence gate and re-cut
-                v_ads_to_cut, v_ads_for_ui, v_ads_held, v_corroborated_count = _gate_verification_ads_by_confidence(
+                (v_ads_to_cut, v_ads_for_ui, gated_held,
+                 v_corroborated_count) = _gate_verification_ads_by_confidence(
                     verification_ads_processed, verification_ads_original,
                     min_cut_confidence,
                     pass1_held_markers=pass1_held_markers,
                     verification_miss_hold_min_confidence=verification_miss_hold_min_confidence,
                     verification_miss_autocut_min_confidence=verification_miss_autocut_min_confidence,
                 )
+                v_ads_held.extend(gated_held)
 
                 # Pass 2 reviewer operates on original-coord ads (the prompt
                 # context window comes from the original transcript). Adjust
@@ -2551,6 +2817,11 @@ def _run_verification_pass(ctx, processed_path, pass1_cuts,
                     cue_gate_enabled=cue_gate_enabled,
                 )
 
+                _stamp_pass2_cut_actions(
+                    v_ads_to_cut, v_ads_for_ui, segment_actions)
+                v_ads_to_cut, v_ads_for_ui = _reconcile_pass2_cut_actions(
+                    v_ads_to_cut, v_ads_for_ui, pass1_cuts)
+
                 if v_ads_to_cut:
                     audio_logger.info(
                         f"[{slug}:{episode_id}] Re-cutting pass 1 output for "
@@ -2562,6 +2833,7 @@ def _run_verification_pass(ctx, processed_path, pass1_cuts,
                     processed_path, recut_applied, recut_ok = _recut_processed_audio(
                         slug, episode_id, processed_path, v_ads_to_cut,
                         local_audio_processor,
+                        cut_barriers=keep_barriers_processed,
                     )
                     if recut_ok:
                         _drop_uncovered_pass2_ads(
@@ -2575,11 +2847,12 @@ def _run_verification_pass(ctx, processed_path, pass1_cuts,
                     else:
                         v_ads_for_ui = []
 
-            # Added after the gate assigns v_ads_held, so the reassignment
-            # above cannot discard them. Held ads must never also enter
-            # v_ads_for_ui or the marker is saved twice.
-            v_ads_held.extend(kept_conflicts)
-        else:
+        # Kept conflicts are disjoint from the category and confidence output.
+        # They remain uncut and must never also enter v_ads_for_ui.
+        v_ads_held.extend(kept_conflicts)
+        if (not had_verification_candidates
+                and not category_kept
+                and not kept_conflicts):
             audio_logger.info(f"[{slug}:{episode_id}] Verification: clean")
 
         verification_ok = True
@@ -4255,6 +4528,7 @@ def process_episode(slug: str, episode_id: str, episode_url: str,
                 pass1_held_markers=pass1_held_markers,
                 pass1_kept_markers=pass1_kept_markers,
                 skip_verification=skip_detection or skip_second_pass or cue_only,
+                segment_actions=segment_actions,
             )
             # Detection-event accounting, not unique cues (issue #350): a cue
             # in a region pass 1 left in the audio is re-detected here and
@@ -4291,10 +4565,10 @@ def process_episode(slug: str, episode_id: str, episode_url: str,
             _check_cancel(cancel_event, slug, episode_id)
 
             # Merge pass 2 ads into combined list for UI.
-            # v_ads_held (held-for-review originals) merge here too so they
-            # survive into persisted markers with was_cut=False; they are kept
-            # separate from v_ads_for_ui so the reviewer pool and asset mapping
-            # are never contaminated with held ads.
+            # v_ads_held (held-for-review and category-kept originals) merge
+            # here too so every uncut pass-2 marker survives persistence. They
+            # stay separate from v_ads_for_ui so the reviewer pool and asset
+            # mapping are never contaminated with uncut ads.
             merge_v = _dedupe_pass2_markers(
                 _stamp_pass2_marker_categories(v_ads_for_ui + v_ads_held))
             # Corroboration stamps mutated markers already in

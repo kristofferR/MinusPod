@@ -41,6 +41,16 @@ def test_contained_cut_merges_to_outer_end(processor):
     assert cuts == [{'start': 100.0, 'end': 160.0, 'replacement_duration': beep}]
 
 
+def test_overlapping_cuts_merge_despite_surrounding_barrier(processor):
+    beep = processor.get_beep_duration()
+    cuts = processor.compute_applied_cuts(
+        [{'start': 100.0, 'end': 160.0}, {'start': 110.0, 'end': 120.0}],
+        600.0,
+        cut_barriers=[{'start': 90.0, 'end': 170.0}],
+    )
+    assert cuts == [{'start': 100.0, 'end': 160.0, 'replacement_duration': beep}]
+
+
 def test_short_cut_dropped(processor):
     beep = processor.get_beep_duration()
     cuts = processor.compute_applied_cuts(
@@ -65,6 +75,44 @@ def test_end_of_episode_cut_extends_to_total_duration(processor):
     assert cuts == [{'start': 500.0, 'end': 600.0, 'replacement_duration': beep}]
     # Caller's list is not mutated (it is reused for UI/finalize)
     assert requested[0]['end'] == 580.0
+
+
+def test_kept_tail_blocks_end_of_episode_extension(processor):
+    beep = processor.get_beep_duration()
+    cuts = processor.compute_applied_cuts(
+        [{'start': 100.0, 'end': 140.0}], 165.0,
+        cut_barriers=[{'start': 145.0, 'end': 160.0}],
+    )
+
+    assert cuts == [
+        {'start': 100.0, 'end': 140.0, 'replacement_duration': beep},
+    ]
+
+
+def test_earlier_keep_does_not_block_trailing_extension(processor):
+    beep = processor.get_beep_duration()
+    cuts = processor.compute_applied_cuts(
+        [{'start': 130.0, 'end': 165.0}], 170.0,
+        cut_barriers=[{'start': 100.0, 'end': 120.0}],
+    )
+
+    assert cuts == [
+        {'start': 130.0, 'end': 170.0, 'replacement_duration': beep},
+    ]
+
+
+def test_keep_barrier_prevents_cut_fragments_from_remerging(processor):
+    beep = processor.get_beep_duration()
+    cuts = processor.compute_applied_cuts(
+        [{'start': 100.0, 'end': 112.0},
+         {'start': 112.5, 'end': 125.0}], 600.0,
+        cut_barriers=[{'start': 112.0, 'end': 112.5}],
+    )
+
+    assert cuts == [
+        {'start': 100.0, 'end': 112.0, 'replacement_duration': beep},
+        {'start': 112.5, 'end': 125.0, 'replacement_duration': beep},
+    ]
 
 
 def test_no_end_trim_when_enough_content_remains(processor):
@@ -129,6 +177,19 @@ def test_short_cut_without_trust_fields_dropped(processor):
     # No confidence/stage at all (older callers): old behavior preserved.
     cuts = processor.compute_applied_cuts([{'start': 100.0, 'end': 107.0}], 600.0)
     assert cuts == []
+
+
+def test_short_fragment_split_from_valid_cut_is_kept(processor):
+    cuts = processor.compute_applied_cuts(
+        [{'start': 100.0, 'end': 108.0, 'confidence': 0.85,
+          '_trusted_split_fragment': True}],
+        600.0,
+    )
+
+    assert len(cuts) == 1
+    assert cuts[0]['start'] == 100.0
+    assert cuts[0]['end'] == 108.0
+    assert '_trusted_split_fragment' not in cuts[0]
 
 
 def test_merge_carries_strongest_trust_signal(processor):

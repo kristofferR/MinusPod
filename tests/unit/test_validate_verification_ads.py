@@ -19,6 +19,7 @@ _test_data_dir = bootstrap('validate_vads_test_')
 from main_app.processing import (
     _drop_uncovered_pass2_ads,
     _gate_verification_ads_by_confidence,
+    _recut_processed_audio,
     _validate_verification_ads,
 )
 import main_app.processing as processing_mod
@@ -41,11 +42,13 @@ def _segments(duration=600.0):
     return [_seg(t, t + 30.0) for t in range(0, int(duration), 30)]
 
 
-def _run(processed, original, duration=600.0):
+def _run(processed, original, duration=600.0, keep_barriers_processed=None):
     return _validate_verification_ads(
         'show', 'ep1', processed, original, _segments(duration),
         ads_to_remove=[], episode_description=None,
         min_cut_confidence=0.8, db=_db(),
+        processed_duration=duration,
+        keep_barriers_processed=keep_barriers_processed,
     )
 
 
@@ -123,6 +126,56 @@ def test_pairing_key_never_leaks_into_outputs():
 
     for ad in kept_proc + kept_orig + processed + original:
         assert '_orig_twin' not in ad
+
+
+def test_kept_tail_blocks_trailing_ad_extension():
+    processed = [
+        {'start': 100.0, 'end': 140.0, 'confidence': 0.9,
+         'category': 'sponsor'},
+    ]
+    original = [
+        {'start': 1100.0, 'end': 1140.0, 'marker': 'removable'},
+    ]
+    kept_tail = [
+        {'start': 145.0, 'end': 165.0, 'confidence': 0.9,
+         'category': 'self_promo', 'action_applied': 'keep'},
+    ]
+
+    kept_proc, kept_orig = _run(
+        processed, original, duration=170.0,
+        keep_barriers_processed=kept_tail,
+    )
+
+    assert len(kept_proc) == len(kept_orig) == 1
+    assert kept_proc[0]['end'] == 140.0
+    assert kept_orig[0]['marker'] == 'removable'
+    assert '_pass2_keep_barrier' not in kept_tail[0]
+
+
+def test_recut_carries_kept_tail_to_applied_cut_computation():
+    processor = MagicMock()
+    processor.process_episode.return_value = None
+    cuts = [
+        {'start': 100.0, 'end': 140.0, 'action_applied': 'remove'},
+    ]
+    barriers = [
+        {'start': 145.0, 'end': 165.0, 'action_applied': 'keep'},
+    ]
+
+    path, applied, ok = _recut_processed_audio(
+        'show', 'ep1', '/tmp/nonexistent-pass2.mp3', cuts, processor,
+        cut_barriers=barriers,
+    )
+
+    assert path == '/tmp/nonexistent-pass2.mp3'
+    assert applied is None
+    assert ok is False
+    processor.process_episode.assert_called_once_with(
+        '/tmp/nonexistent-pass2.mp3',
+        [{'start': 100.0, 'end': 140.0, 'action_applied': 'remove',
+          'beep': False}],
+        cut_barriers=barriers,
+    )
 
 
 def test_explicit_duration_is_validator_clamp_target():
@@ -839,6 +892,26 @@ def test_drop_uncovered_handles_twinless_cut():
 
     assert v_ads_to_cut == [covered]
     assert filtered['was_cut'] is False
+
+
+def test_drop_uncovered_removes_split_cut_ui_twin():
+    covered = {'start': 100.0, 'end': 130.0}
+    filtered = {'start': 150.0, 'end': 155.0}
+    covered_ui = {'start': 1100.0, 'end': 1130.0}
+    filtered_ui = {'start': 1150.0, 'end': 1155.0}
+    v_ads_to_cut = [covered, filtered]
+    v_ads_for_ui = [covered_ui, filtered_ui]
+
+    _drop_uncovered_pass2_ads(
+        's', 'e', v_ads_to_cut, v_ads_for_ui,
+        [{'start': 100.0, 'end': 130.0}], [], [],
+        total_duration=600.0,
+    )
+
+    assert v_ads_to_cut == [covered]
+    assert v_ads_for_ui == [covered_ui]
+    assert filtered['was_cut'] is False
+    assert filtered_ui['was_cut'] is False
 
 
 def test_filing_respects_human_reject(monkeypatch):

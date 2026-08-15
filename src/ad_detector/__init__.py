@@ -1050,8 +1050,8 @@ class AdDetector:
 
         ``category_repair_enabled``: when True, any window with an ad missing
         "category" gets one follow-up LLM call for just those categories (see
-        ``_repair_window_categories``). False (default; always for
-        verification) skips repair, no extra calls.
+        ``_repair_window_categories``). False skips repair and makes no extra
+        calls.
 
         Returns ``(final_ads, all_raw_responses, failed_windows,
         failure_response, category_missing, category_total,
@@ -2306,17 +2306,19 @@ class AdDetector:
 
             # Check for overlap (within 3 seconds)
             if current['start'] <= last['end'] + 3.0:
+                last_action = (resolve_category_action(
+                    last.get('category'), action_map) if action_map else None)
+                current_action = (resolve_category_action(
+                    current.get('category'), action_map) if action_map else None)
                 same_action = (
-                    action_map is None
-                    or resolve_category_action(last.get('category'), action_map)
-                       == resolve_category_action(current.get('category'), action_map)
-                )
+                    action_map is None or last_action == current_action)
                 if not same_action:
                     # Contested audio: never merge a keep-resolving marker
                     # into a remove-resolving one, and never let a shorter
                     # span nested inside the other collapse to nothing (e.g.
                     # an intro/outro inside a remove-resolving match).
-                    new_last, new_entries = split_conflicting_action_span(last, current)
+                    new_last, new_entries = split_conflicting_action_span(
+                        last, current, last_action, current_action)
                     if new_last is None:
                         merged.pop()
                     else:
@@ -2642,14 +2644,22 @@ class AdDetector:
             if sponsor_history:
                 description_section += sponsor_history
 
+            # Category actions must enter at the earliest merge seam. The
+            # default verification prompt requires a category, and configured
+            # non-default actions enable the same narrow repair pass used by
+            # pass 1 for custom/legacy prompts or omitted model fields.
+            action_map = self._resolve_segment_action_map(slug)
+            segment_categories_configured = (
+                action_map is not None
+                and any(action != DEFAULT_SEGMENT_ACTION
+                        for action in action_map.values())
+            )
+
             # Verification stamps every surviving ad so the merge downstream
-            # can distinguish first-pass from verification. The verification
-            # prompt never asks for "category", so category counts are
-            # discarded here, and category_repair_enabled stays False: repair
-            # would be a no-op on every ad and cost a call for nothing.
+            # can distinguish first-pass from verification.
             (final_ads, all_raw_responses, _failed_windows, failure,
-             _category_missing, _category_total,
-             _category_repaired) = self._run_detection_pass(
+             category_missing, category_total,
+             category_repaired) = self._run_detection_pass(
                 windows,
                 pass_label='Verification',
                 model=model,
@@ -2666,9 +2676,25 @@ class AdDetector:
                 pass_name=PASS_AD_DETECTION_2,
                 window_label_prefix='Verification Window',
                 validate_timestamps=False,
+                action_map=action_map,
+                category_repair_enabled=segment_categories_configured,
             )
             if failure is not None:
                 return failure
+
+            if category_repaired > 0:
+                logger.info(
+                    f"[{slug}:{episode_id}] Verification category repair "
+                    f"resolved {category_repaired} missing segment "
+                    f"categor{'y' if category_repaired == 1 else 'ies'}"
+                )
+            if segment_categories_configured and category_missing > 0:
+                logger.warning(
+                    f"[{slug}:{episode_id}] Verification left "
+                    f"{category_missing} of {category_total} detections "
+                    f"uncategorized after repair; they default to sponsor, "
+                    f"so per-category actions may not apply as configured."
+                )
 
             # Single stamping point: dedup returns copies, so stamping the
             # final list covers every surviving ad.
@@ -2687,11 +2713,11 @@ class AdDetector:
                 "status": "success",
                 "raw_response": "\n\n".join(all_raw_responses),
                 "prompt": f"Verification: Processed {len(windows)} windows",
-                "model": model
+                "model": model,
+                "segment_actions": action_map,
             }
 
         except Exception as e:
             logger.error(f"[{slug}:{episode_id}] Verification detection failed: {e}")
             return {"ads": [], "status": "failed", "error": str(e), "retryable": is_retryable_error(e),
                     "model_not_configured": isinstance(e, ModelNotConfiguredError)}
-
