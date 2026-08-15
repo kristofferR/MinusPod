@@ -674,6 +674,29 @@ class TestConfirmedCorrections:
         assert out['end'] == 170.0
         assert out['validation']['user_confirmed'] is True
 
+    def test_expanded_boundary_adjustment_survives_trailing_extension(self):
+        validator = AdValidator(
+            episode_duration=200.0,
+            segments=[],
+            confirmed_corrections=[{
+                'start': 160.0,
+                'end': 170.0,
+                'confirmed_span': {'start': 140.0, 'end': 180.0},
+            }],
+        )
+        ad = {
+            'start': 140.0,
+            'end': 180.0,
+            'confidence': 0.4,
+            'reason': 'Human-expanded tail ad',
+        }
+
+        out = validator.validate([ad]).ads[0]
+
+        assert out['start'] == 140.0
+        assert out['end'] == 180.0
+        assert out['validation']['user_confirmed'] is True
+
     def test_trimmed_confirm_clamps_wider_redetection(self):
         """A trimmed approval (confirmed_span) clamps a re-detected wider span
         so the trimmed-out content is never cut by a later reprocess."""
