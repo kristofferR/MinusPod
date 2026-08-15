@@ -621,12 +621,13 @@ class TestPartitionPass2CategoryActions:
         processed, original = self._pair(
             'self_promo', held_for_review=True, hold_reason='max_duration')
 
-        out_p, out_o, kept = processing._partition_pass2_category_actions(
+        out_p, out_o, kept_p, kept_o = processing._partition_pass2_category_actions(
             [processed], [original], self.ACTIONS)
 
         assert out_p == []
         assert out_o == []
-        assert kept == [original]
+        assert kept_p == [processed]
+        assert kept_o == [original]
         for marker in (processed, original):
             assert marker['action_applied'] == 'keep'
             assert marker['was_cut'] is False
@@ -640,12 +641,13 @@ class TestPartitionPass2CategoryActions:
             self, category, expected):
         processed, original = self._pair(category)
 
-        out_p, out_o, kept = processing._partition_pass2_category_actions(
+        out_p, out_o, kept_p, kept_o = processing._partition_pass2_category_actions(
             [processed], [original], self.ACTIONS)
 
         assert out_p == [processed]
         assert out_o == [original]
-        assert kept == []
+        assert kept_p == []
+        assert kept_o == []
         assert 'action_applied' not in processed
         assert 'action_applied' not in original
 
@@ -657,12 +659,13 @@ class TestPartitionPass2CategoryActions:
     def test_defined_pattern_overrides_keep(self):
         processed, original = self._pair('self_promo', pattern_defined=True)
 
-        out_p, out_o, kept = processing._partition_pass2_category_actions(
+        out_p, out_o, kept_p, kept_o = processing._partition_pass2_category_actions(
             [processed], [original], self.ACTIONS)
 
         assert out_p == [processed]
         assert out_o == [original]
-        assert kept == []
+        assert kept_p == []
+        assert kept_o == []
         for marker in (processed, original):
             assert 'action_applied' not in marker
             assert marker['keep_overridden_by_pattern'] is True
@@ -675,18 +678,64 @@ class TestPartitionPass2CategoryActions:
         processed = {'start': 10.0, 'end': 20.0}
         original = {'start': 110.0, 'end': 120.0}
 
-        out_p, out_o, kept = processing._partition_pass2_category_actions(
+        out_p, out_o, kept_p, kept_o = processing._partition_pass2_category_actions(
             [processed], [original], self.ACTIONS)
 
         assert out_p == [processed]
         assert out_o == [original]
-        assert kept == []
+        assert kept_p == []
+        assert kept_o == []
         assert 'action_applied' not in processed
         assert 'action_applied' not in original
 
         processing._stamp_pass2_cut_actions(out_p, out_o, self.ACTIONS)
         assert processed['action_applied'] == 'remove'
         assert original['action_applied'] == 'remove'
+
+    def test_overlapping_candidate_splits_around_kept_audio(self):
+        processed = {'start': 100.0, 'end': 180.0, 'reason': 'heuristic roll'}
+        original = {'start': 119.0, 'end': 199.0, 'reason': 'heuristic roll'}
+        kept = {'start': 130.0, 'end': 150.0, 'category': 'self_promo'}
+        pass1_cuts = [
+            {'start': 50.0, 'end': 70.0, 'replacement_duration': 1.0},
+        ]
+
+        out_p, out_o = processing._exclude_category_kept_spans(
+            [processed], [original], [kept], pass1_cuts)
+
+        assert [(ad['start'], ad['end']) for ad in out_p] == [
+            (100.0, 130.0), (150.0, 180.0),
+        ]
+        assert [(ad['start'], ad['end']) for ad in out_o] == [
+            (119.0, 149.0), (169.0, 199.0),
+        ]
+        assert all(ad['reason'] == 'heuristic roll' for ad in out_p + out_o)
+
+    def test_kept_audio_covering_candidate_drops_it(self):
+        processed, original = self._pair(None)
+        kept = {'start': 5.0, 'end': 25.0, 'category': 'self_promo'}
+
+        out_p, out_o = processing._exclude_category_kept_spans(
+            [processed], [original], [kept], [])
+
+        assert out_p == []
+        assert out_o == []
+
+    def test_pass1_and_pass2_keeps_share_processed_barrier_list(self):
+        pass1_keep = {'start': 100.0, 'end': 120.0, 'action_applied': 'keep'}
+        pass2_keep = {'start': 200.0, 'end': 220.0, 'action_applied': 'keep'}
+        pass1_cuts = [
+            {'start': 20.0, 'end': 40.0, 'replacement_duration': 1.0},
+        ]
+
+        barriers = processing._pass2_keep_barriers_processed(
+            [pass1_keep], pass1_cuts, [pass2_keep])
+
+        assert [(marker['start'], marker['end']) for marker in barriers] == [
+            (81.0, 101.0), (200.0, 220.0),
+        ]
+        assert barriers[1] is pass2_keep
+        assert (pass1_keep['start'], pass1_keep['end']) == (100.0, 120.0)
 
     def test_run_verification_persists_keep_without_recut(self):
         ctx = types.SimpleNamespace(
