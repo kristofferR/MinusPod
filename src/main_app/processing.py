@@ -2637,7 +2637,7 @@ def _run_verification_pass(ctx, processed_path, pass1_cuts,
                  validated_kept_conflicts) = _exclude_kept_spans_from_verification(
                     verification_ads_processed,
                     verification_ads_original,
-                    pass1_kept_markers,
+                    (pass1_kept_markers or []) + category_kept,
                     pass1_cuts,
                 )
                 kept_conflicts.extend(validated_kept_conflicts)

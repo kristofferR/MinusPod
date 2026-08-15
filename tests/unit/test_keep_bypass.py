@@ -817,6 +817,55 @@ class TestPartitionPass2CategoryActions:
         assert original['held_for_review'] is True
         assert original['hold_reason'] == 'verification_kept_conflict'
 
+    def test_validation_expansion_into_category_keep_is_diverted_before_gate(self):
+        """A validated span must not cross a category-kept pass-2 marker."""
+        ctx = types.SimpleNamespace(
+            slug='pass2-actions', episode_id='ep1', podcast_id=1,
+            podcast_name='Test Show', episode_title='Episode',
+            episode_description=None, podcast_description=None,
+        )
+        candidate = {
+            'start': 100.0, 'end': 110.0, 'confidence': 0.95,
+            'category': 'sponsor',
+        }
+        original = dict(candidate)
+        category_keep = {
+            'start': 115.0, 'end': 125.0, 'confidence': 0.95,
+            'category': 'self_promo',
+        }
+        validated_candidate = {**candidate, 'end': 120.0}
+        audio_processor = types.SimpleNamespace(
+            get_audio_duration=lambda _path: 200.0)
+
+        with ExitStack() as stack:
+            db = stack.enter_context(patch.object(processing, 'db'))
+            stack.enter_context(patch.object(processing, 'storage'))
+            stack.enter_context(patch.object(
+                processing, '_apply_pass2_heuristic_rolls'))
+            stack.enter_context(patch.object(
+                processing, '_validate_verification_ads',
+                return_value=([validated_candidate], [original])))
+            verifier_cls = stack.enter_context(
+                patch('verification_pass.VerificationPass'))
+            verifier_cls.return_value.verify.return_value = {
+                'ads': [original, category_keep],
+                'ads_processed': [candidate, category_keep],
+                'segments': SEGMENTS,
+                'status': 'success',
+            }
+            db.get_setting_float.return_value = 0.6
+
+            result = processing._run_verification_pass(
+                ctx, '/tmp/pass2-actions.mp3', [], False, 0.8,
+                audio_processor, None, segment_actions=self.ACTIONS,
+            )
+
+        assert result[0] == 0
+        assert result[1] == []
+        assert result[3] == [category_keep, original]
+        assert original['held_for_review'] is True
+        assert original['hold_reason'] == 'verification_kept_conflict'
+
 
 def test_dedupe_pass2_markers_collapses_repeats():
     """The merge concatenates the UI and held lists, so a marker reaching both
