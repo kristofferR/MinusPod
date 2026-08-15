@@ -276,6 +276,8 @@ class AudioProcessor:
         sorted_segments = sorted(clamped, key=lambda x: x['start'])
 
         def crosses_barrier(start, end):
+            if end <= start:
+                return False
             return any(
                 barrier['start'] < end and barrier['end'] > start
                 for barrier in cut_barriers or []
