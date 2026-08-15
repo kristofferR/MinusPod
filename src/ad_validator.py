@@ -391,6 +391,8 @@ class AdValidator:
         for ad in ads:
             ad['_matches_false_positive_correction'] = (
                 self._overlaps_false_positive(ad['start'], ad['end']))
+            ad['_pre_restore_confirmed_correction'] = (
+                self._matching_confirmed(ad['start'], ad['end']))
 
         # Step 1: Auto-correct boundaries
         ads = self._clamp_boundaries(ads, result)
@@ -459,6 +461,8 @@ class AdValidator:
         # it so validation-only bookkeeping is never persisted or returned.
         matched_false_positive = ad.pop(
             '_matches_false_positive_correction', False)
+        pre_restore_confirmed = ad.pop(
+            '_pre_restore_confirmed_correction', None)
         if (matched_false_positive
                 or self._overlaps_false_positive(ad['start'], ad['end'])):
             flags.append("INFO: User marked as false positive")
@@ -477,7 +481,8 @@ class AdValidator:
             return ad
 
         # Check for user-confirmed corrections (second priority)
-        confirmed = self._matching_confirmed(ad['start'], ad['end'])
+        confirmed = (pre_restore_confirmed
+                     or self._matching_confirmed(ad['start'], ad['end']))
         if confirmed is not None:
             # A trimmed approval confirmed only a sub-span as ad. Pull a
             # boundary inward only when it falls in a trimmed-out zone (inside
@@ -1077,6 +1082,8 @@ class AdValidator:
                     != bool(current.get('differential_uncorroborated'))
                     or bool(last.get('held_for_review'))
                     != bool(current.get('held_for_review'))
+                    or last.get('_pre_restore_confirmed_correction') is not None
+                    or current.get('_pre_restore_confirmed_correction') is not None
                     or bool(last.get('_matches_false_positive_correction'))
                     != bool(current.get('_matches_false_positive_correction'))):
                 merged.append(current.copy())
