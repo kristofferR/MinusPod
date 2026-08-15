@@ -5,6 +5,18 @@ from typing import Dict, List, Optional, Tuple
 DAI_CORE_SPANS = 'dai_core_spans'
 
 
+def invalidate_tail_provenance(marker: Dict, new_end: float) -> None:
+    """Drop tail-growth eligibility when a stage selects a new end.
+
+    Content-tail provenance describes how the current edge was reached. A
+    reviewer or human-selected end must earn any later sonic-tail extension
+    from fresh evidence instead of reusing stale eligibility.
+    """
+    if marker.get('end') != new_end:
+        marker.pop('end_extended_by_content', None)
+        marker.pop('tail_splice_snap', None)
+
+
 def _valid_dai_core_spans(marker: Dict) -> List[Dict[str, float]]:
     """Return normalized measured DAI spans from a marker.
 
