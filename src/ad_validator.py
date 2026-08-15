@@ -1131,7 +1131,9 @@ class AdValidator:
             # (any hold reason) -- the fold would hold the real ad or cut
             # the held span, and on an auto-approve recut it would grow the
             # marker past its trimmed confirm so the confirmed_span clamp
-            # never fires and trimmed-out audio gets cut.
+            # never fires and trimmed-out audio gets cut. A confirmed
+            # correction on either marker also blocks the merge: even a
+            # shared correction must not authorize the adjacent audio.
             if (bool(last.get('differential_uncorroborated'))
                     != bool(current.get('differential_uncorroborated'))
                     or bool(last.get('held_for_review'))

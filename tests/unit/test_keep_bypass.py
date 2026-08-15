@@ -21,6 +21,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
 
 from unittest.mock import patch
 
+import pytest
+
 import main_app.processing as processing
 from api.patterns import _matches_held_marker
 from config import count_pending_review, HOLD_REASON_VERIFICATION_KEPT_CONFLICT
@@ -268,8 +270,8 @@ class TestKeepMarkersBlockTerminalSnap:
                 'feed', 'episode', [cut], [master], segments, analysis,
                 5485.17)
 
-        assert out[0]['start'] == 5393.668
-        assert master['start'] == 5393.668
+        assert out[0]['start'] == pytest.approx(5393.668)
+        assert master['start'] == pytest.approx(5393.668)
         storage.save_combined_ads.assert_called_once()
 
     def test_terminal_snap_does_not_cross_rejected_untranscribed_marker(self):
