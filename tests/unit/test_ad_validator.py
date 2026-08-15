@@ -416,6 +416,42 @@ class TestAdValidatorFalsePositives:
         assert result.ads[0]['validation']['decision'] == Decision.REJECT.value
         assert result.ads[1]['validation']['decision'] == Decision.ACCEPT.value
 
+    def test_dedup_keeps_fragment_that_does_not_restore_into_false_positive(
+            self, sample_transcript):
+        validator = AdValidator(
+            episode_duration=300.0,
+            segments=sample_transcript,
+            false_positive_corrections=[{'start': 100.0, 'end': 180.0}],
+            confirmed_corrections=[{
+                'start': 190.0,
+                'end': 200.0,
+                'confirmed_span': {'start': 190.0, 'end': 200.0},
+            }],
+        )
+        fragments = [
+            {
+                'start': 190.0,
+                'end': 200.0,
+                'confidence': 0.95,
+                'reason': 'DAI fragment expanded into user-kept content',
+                'dai_core_spans': [{'start': 100.0, 'end': 200.0}],
+            },
+            {
+                'start': 190.0,
+                'end': 200.0,
+                'confidence': 0.95,
+                'reason': 'DAI fragment within approved bounds',
+            },
+        ]
+
+        result = validator.validate(fragments)
+
+        assert len(result.ads) == 2
+        assert result.accepted == 1
+        assert result.rejected == 1
+        assert result.ads[1]['start'] == 190.0
+        assert result.ads[1]['end'] == 200.0
+
 
 class TestAdValidatorReasonQuality:
     """Tests for reason quality checks."""
@@ -651,6 +687,29 @@ class TestConfirmedCorrections:
         assert 'INFO: User confirmed as ad' not in (
             result.ads[0]['validation']['flags'])
 
+    def test_trimmed_confirm_survives_trailing_extension(self):
+        validator = AdValidator(
+            episode_duration=200.0,
+            segments=[],
+            confirmed_corrections=[{
+                'start': 160.0,
+                'end': 170.0,
+                'confirmed_span': {'start': 160.0, 'end': 170.0},
+            }],
+        )
+        ad = {
+            'start': 160.0,
+            'end': 170.0,
+            'confidence': 0.4,
+            'reason': 'Human-trimmed tail ad',
+        }
+
+        out = validator.validate([ad]).ads[0]
+
+        assert out['start'] == 160.0
+        assert out['end'] == 170.0
+        assert out['validation']['user_confirmed'] is True
+
     def test_trimmed_confirm_clamps_wider_redetection(self):
         """A trimmed approval (confirmed_span) clamps a re-detected wider span
         so the trimmed-out content is never cut by a later reprocess."""
@@ -707,6 +766,112 @@ class TestConfirmedCorrections:
         assert 'INFO: Clamped to user-approved span' in (
             out['validation']['flags'])
 
+    def test_confirmed_span_deduplicates_fragmented_redetection(self):
+        validator = AdValidator(
+            episode_duration=600.0,
+            segments=[],
+            confirmed_corrections=[{
+                'start': 100.0,
+                'end': 200.0,
+                'confirmed_span': {'start': 120.0, 'end': 180.0},
+            }],
+        )
+
+        result = validator.validate([
+            {
+                'start': 120.0,
+                'end': 150.0,
+                'confidence': 0.4,
+                'reason': 'First DAI fragment',
+                'detection_stage': 'dai_differential',
+            },
+            {
+                'start': 150.0,
+                'end': 180.0,
+                'confidence': 0.4,
+                'reason': 'Second DAI fragment',
+                'detection_stage': 'dai_differential',
+            },
+        ])
+
+        assert result.accepted == 1
+        assert len(result.ads) == 1
+        assert result.ads[0]['start'] == 120.0
+        assert result.ads[0]['end'] == 180.0
+
+    def test_confirmed_span_dedup_ignores_kept_content_fragment(self):
+        validator = AdValidator(
+            episode_duration=600.0,
+            segments=[],
+            confirmed_corrections=[{
+                'start': 100.0,
+                'end': 180.0,
+                'confirmed_span': {'start': 120.0, 'end': 180.0},
+            }],
+        )
+
+        result = validator.validate([
+            {
+                'start': 100.0,
+                'end': 118.0,
+                'confidence': 0.4,
+                'reason': 'Fragment in user-kept content',
+                'detection_stage': 'dai_differential',
+            },
+            {
+                'start': 120.0,
+                'end': 150.0,
+                'confidence': 0.4,
+                'reason': 'Fragment in approved ad',
+                'detection_stage': 'dai_differential',
+            },
+        ])
+
+        assert len(result.ads) == 2
+        assert result.ads[0]['start'] == 100.0
+        assert result.ads[0]['end'] == 118.0
+        assert 'user_confirmed' not in result.ads[0]['validation']
+        assert result.ads[1]['start'] == 120.0
+        assert result.ads[1]['end'] == 180.0
+        assert result.ads[1]['validation']['user_confirmed'] is True
+
+    def test_confirmed_span_dedup_ignores_false_positive_fragment(self):
+        validator = AdValidator(
+            episode_duration=600.0,
+            segments=[],
+            false_positive_corrections=[{'start': 115.0, 'end': 125.0}],
+            confirmed_corrections=[{
+                'start': 100.0,
+                'end': 180.0,
+                'confirmed_span': {'start': 120.0, 'end': 180.0},
+            }],
+        )
+
+        result = validator.validate([
+            {
+                'start': 115.0,
+                'end': 125.0,
+                'confidence': 0.4,
+                'reason': 'False-positive fragment',
+                'detection_stage': 'dai_differential',
+            },
+            {
+                'start': 125.0,
+                'end': 180.0,
+                'confidence': 0.4,
+                'reason': 'Approved ad fragment',
+                'detection_stage': 'dai_differential',
+            },
+        ])
+
+        assert result.rejected == 1
+        assert result.accepted == 1
+        approved_ad = next(
+            ad for ad in result.ads
+            if ad['validation']['decision'] == Decision.ACCEPT.value)
+        assert approved_ad['start'] == 120.0
+        assert approved_ad['end'] == 180.0
+
     def test_newer_exact_correction_wins_over_older_trimmed_confirm(self):
         validator = AdValidator(
             episode_duration=600.0,
@@ -752,6 +917,7 @@ class TestConfirmedCorrections:
 
         out = validator.validate([ad]).ads[0]
 
+        assert out['start'] == 120.0
         assert out['end'] == 175.0
         assert out['validation']['confirmed_span'] == {
             'start': 120.0, 'end': 175.0}
@@ -773,6 +939,8 @@ class TestConfirmedCorrections:
             'reason': 'Dynamically inserted ad',
             'detection_stage': 'dai_differential',
             'dai_core_spans': [{'start': 100.0, 'end': 160.0}],
+            'end_extended_by_content': True,
+            'tail_splice_snap': {'original_end': 150.0, 'event_time': 160.0},
         }
 
         out = validator.validate([ad]).ads[0]
@@ -780,6 +948,8 @@ class TestConfirmedCorrections:
         assert out['start'] == 120.0
         assert out['end'] == 140.0
         assert out['dai_core_spans'] == [{'start': 120.0, 'end': 140.0}]
+        assert 'end_extended_by_content' not in out
+        assert 'tail_splice_snap' not in out
 
     def test_plain_confirm_does_not_clamp(self):
         """A confirm without confirmed_span accepts the ad at its own bounds."""
@@ -838,9 +1008,8 @@ class TestConfirmedCorrections:
         assert 'INFO: Clamped to user-approved span' not in out['validation']['flags']
         assert out['start'] == 100.0 and out['end'] == 128.0  # bounds untouched
 
-    def test_clamp_keeps_extension_beyond_reviewed_bounds(self):
-        """A merged detection extending past the reviewed original bounds keeps
-        the extension (new ad territory); only the trimmed-out zone is pulled."""
+    def test_trimmed_confirm_clamps_extension_beyond_reviewed_bounds(self):
+        """Known ad audio is still cut when a new detection grows around it."""
         confirmed = [
             {'start': 100.0, 'end': 200.0,
              'confirmed_span': {'start': 130.0, 'end': 200.0}}
@@ -860,11 +1029,38 @@ class TestConfirmedCorrections:
         result = validator.validate([ad])
         out = result.ads[0]
         assert out['start'] == 130.0
-        assert out['end'] == 240.0
+        assert out['end'] == 200.0
         assert out['validation']['decision'] == Decision.ACCEPT.value
-        assert 'user_confirmed' not in out['validation']
-        assert 'INFO: User confirmation covers only part of segment' in (
-            out['validation']['flags'])
+        assert out['validation']['user_confirmed'] is True
+        assert 'INFO: User confirmed as ad' in out['validation']['flags']
+
+    def test_df_wider_redetection_keeps_english_and_cuts_approved_ad(self):
+        validator = AdValidator(
+            episode_duration=5485.17,
+            segments=[],
+            confirmed_corrections=[{
+                'start': 1361.654,
+                'end': 1409.104,
+                'confirmed_span': {'start': 1361.5, 'end': 1408.93},
+            }],
+        )
+        ad = {
+            'start': 1355.9,
+            'end': 1408.93,
+            'confidence': 0.95,
+            'reason': 'Wider DAI re-detection after English show speech',
+            'detection_stage': 'dai_differential',
+            'dai_core_spans': [{'start': 1361.5, 'end': 1406.4}],
+        }
+
+        out = validator.validate([ad]).ads[0]
+
+        assert out['start'] == 1361.5
+        assert out['end'] == 1408.93
+        assert out['validation']['decision'] == Decision.ACCEPT.value
+        assert out['validation']['user_confirmed'] is True
+        assert out['validation']['confirmed_span'] == {
+            'start': 1361.5, 'end': 1408.93}
 
     def test_partial_confirm_does_not_authorize_adjacent_merged_ad(self):
         validator = AdValidator(

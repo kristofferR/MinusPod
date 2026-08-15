@@ -33,7 +33,7 @@ from audio_processor import get_replacement_duration, AudioProcessor
 from cancel import ProcessingCancelled, _check_cancel, _cancel_events, _cancel_events_lock
 from differential_fetcher import fetch_and_diff, is_likely_dai_feed
 from utils.audio import get_audio_codec, get_audio_duration
-from utils.markers import clip_dai_core_spans
+from utils.markers import clip_dai_core_spans, invalidate_tail_provenance
 from utils.time import (
     adjust_timestamp, merge_cut_spans, overlap_ratio, overlap_seconds,
     ranges_overlap, span_inside_any_cut, utc_now_iso,
@@ -1643,9 +1643,7 @@ def _apply_reviewer_verdict_to_ad(ad, v):
     if v.verdict == 'adjust':
         ad['reviewer_original_start'] = v.original_start
         ad['reviewer_original_end'] = v.original_end
-        if v.adjusted_end != ad.get('end'):
-            ad.pop('end_extended_by_content', None)
-            ad.pop('tail_splice_snap', None)
+        invalidate_tail_provenance(ad, v.adjusted_end)
         ad['start'] = v.adjusted_start
         ad['end'] = v.adjusted_end
     elif v.verdict == 'reject':
@@ -1784,8 +1782,13 @@ def _snap_terminal_starts(slug, episode_id, ads_to_remove, all_ads_with_validati
     # cross. Rejected, held, and kept markers are explicit barriers, including
     # when their audio is untranscribed.
     coverage_ads = list(ads_to_remove)
+    cut_marker_ids = {id(marker) for marker in coverage_ads}
+    for marker in coverage_ads:
+        master = _find_master(all_ads_with_validation, marker)
+        if master is not None:
+            cut_marker_ids.add(id(master))
     blocking_ads = [m for m in all_ads_with_validation
-                    if m.get('was_cut') is False]
+                    if id(m) not in cut_marker_ids and not m.get('was_cut')]
     snapped = snap_terminal_ad_to_splice(
         ads_to_remove, segments, events, episode_duration, window_s,
         coverage_ads=coverage_ads, blocking_ads=blocking_ads,
@@ -1874,6 +1877,12 @@ def _snap_completed_cut_tails_to_splice(
     splice = getattr(audio_analysis_result, 'splice_evidence', None) or {}
     if not isinstance(splice, dict):
         return ads_to_remove
+    calibration = splice.get('calibration') or {}
+    if (not isinstance(calibration, dict)
+            or calibration.get('status') != 'calibrated'):
+        # Cold-start splice events may corroborate another detector, but they
+        # are not calibrated well enough to extend a destructive cut.
+        return ads_to_remove
     events = splice.get('events') or []
     if not isinstance(events, list) or not events:
         return ads_to_remove
@@ -1951,17 +1960,36 @@ def _finalize_user_confirmed_bounds(
         if target_end <= target_start:
             return False
         old_start, old_end = marker['start'], marker['end']
-        if old_end != target_end:
-            marker.pop('end_extended_by_content', None)
-            marker.pop('tail_splice_snap', None)
+        missing = object()
+        old_metadata = (
+            marker.get('end_extended_by_content', missing),
+            marker.get('tail_splice_snap', missing),
+            marker.get('dai_core_spans', missing),
+        )
+        # Final human authority supersedes how an automatic tail happened to
+        # reach even the same edge; do not let that stale provenance enable a
+        # later expansion on reload.
+        marker.pop('end_extended_by_content', None)
+        marker.pop('tail_splice_snap', None)
         marker['start'], marker['end'] = target_start, target_end
         clip_dai_core_spans(marker, target_start, target_end)
         flags = (marker.get('validation') or {}).get('flags')
+        note_added = False
         if isinstance(flags, list):
             note = 'INFO: Finalized to user-approved span'
             if note not in flags:
                 flags.append(note)
-        return (old_start, old_end) != (target_start, target_end)
+                note_added = True
+        new_metadata = (
+            marker.get('end_extended_by_content', missing),
+            marker.get('tail_splice_snap', missing),
+            marker.get('dai_core_spans', missing),
+        )
+        return (
+            (old_start, old_end) != (target_start, target_end)
+            or old_metadata != new_metadata
+            or note_added
+        )
 
     changed = False
     for ad in ads_to_remove:
@@ -1975,6 +2003,9 @@ def _finalize_user_confirmed_bounds(
             master = next((
                 candidate for candidate in all_ads_with_validation
                 if approved_span(candidate) == approved
+                and ranges_overlap(
+                    candidate['start'], candidate['end'],
+                    ad['start'], ad['end'])
             ), None)
         changed = apply_span(ad, approved) or changed
         if master is not None and master is not ad:

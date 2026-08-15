@@ -1,6 +1,9 @@
 """Post-review tail recovery through untranscribed sonic logos."""
 import os
 import sys
+from types import SimpleNamespace
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
 
@@ -8,6 +11,8 @@ from ad_detector.boundaries import (
     _merge_ad_pair,
     snap_extended_ad_tails_to_splice,
 )
+from ad_validator import AdValidator, ValidationResult
+from main_app import processing
 
 
 def _event(time, depth=-120.0, event_type='digital_silence'):
@@ -157,6 +162,7 @@ def test_merge_clears_stale_content_extension_from_earlier_fragment():
             'confidence': 0.9,
             'reason': 'Sponsor ad part one',
             'end_extended_by_content': True,
+            'tail_splice_snap': {'event_time': 130.0},
         },
         {
             'start': 132.0,
@@ -171,9 +177,11 @@ def test_merge_clears_stale_content_extension_from_earlier_fragment():
 
     assert merged['end'] == 160.0
     assert 'end_extended_by_content' not in merged
+    assert 'tail_splice_snap' not in merged
 
 
 def test_merge_preserves_content_extension_on_later_fragment():
+    later_snap = {'event_time': 160.0, 'original_end': 158.0}
     ads = [
         {
             'start': 100.0,
@@ -187,6 +195,7 @@ def test_merge_preserves_content_extension_on_later_fragment():
             'confidence': 0.9,
             'reason': 'Sponsor ad part two',
             'end_extended_by_content': True,
+            'tail_splice_snap': later_snap,
         },
     ]
 
@@ -194,3 +203,108 @@ def test_merge_preserves_content_extension_on_later_fragment():
     _merge_ad_pair(merged, ads[1])
 
     assert merged['end_extended_by_content'] is True
+    assert merged['tail_splice_snap'] == later_snap
+    assert merged['tail_splice_snap'] is not later_snap
+
+
+@pytest.mark.parametrize('gap', [2.0, 8.0])
+def test_validator_merge_clears_stale_earlier_tail_provenance(gap):
+    earlier = {
+        'start': 100.0,
+        'end': 130.0,
+        'confidence': 0.9,
+        'reason': 'Sponsor ad part one',
+        'end_extended_by_content': True,
+        'tail_splice_snap': {'event_time': 130.0},
+    }
+    later = {
+        'start': 130.0 + gap,
+        'end': 160.0,
+        'confidence': 0.9,
+        'reason': 'Sponsor ad part two',
+    }
+    validator = AdValidator(
+        episode_duration=300.0,
+        segments=[{'start': 0.0, 'end': 1.0, 'text': 'intro'}],
+    )
+
+    merged = validator._merge_close_ads(
+        [earlier, later], ValidationResult(ads=[]))[0]
+
+    assert merged['end'] == 160.0
+    assert 'end_extended_by_content' not in merged
+    assert 'tail_splice_snap' not in merged
+
+
+def test_validator_merge_inherits_later_tail_provenance():
+    earlier = {
+        'start': 100.0,
+        'end': 130.0,
+        'confidence': 0.9,
+        'reason': 'Sponsor ad part one',
+    }
+    later_snap = {'event_time': 160.0, 'original_end': 158.0}
+    later = {
+        'start': 132.0,
+        'end': 160.0,
+        'confidence': 0.9,
+        'reason': 'Sponsor ad part two',
+        'end_extended_by_content': True,
+        'tail_splice_snap': later_snap,
+    }
+    validator = AdValidator(episode_duration=300.0, segments=[])
+
+    merged = validator._merge_close_ads(
+        [earlier, later], ValidationResult(ads=[]))[0]
+
+    assert merged['end_extended_by_content'] is True
+    assert merged['tail_splice_snap'] == later_snap
+    assert merged['tail_splice_snap'] is not later_snap
+
+
+def test_processing_skips_destructive_tail_snap_during_cold_start(monkeypatch):
+    marker, segments = _fixture()
+
+    def unexpected_snap(*args, **kwargs):
+        raise AssertionError('cold-start events must not drive a cut extension')
+
+    monkeypatch.setattr(
+        processing, 'snap_extended_ad_tails_to_splice', unexpected_snap)
+    analysis = SimpleNamespace(splice_evidence={
+        'events': [_event(2415.85)],
+        'calibration': {'status': 'cold_start'},
+    })
+
+    result = processing._snap_completed_cut_tails_to_splice(
+        'feed', 'episode', [marker], [marker], segments, analysis)
+
+    assert result == [marker]
+
+
+def test_processing_allows_tail_snap_after_calibration(monkeypatch):
+    marker, segments = _fixture()
+    snapped = dict(marker, end=2415.85, tail_splice_snap={
+        'original_end': 2410.9,
+        'event_time': 2415.85,
+        'event_type': 'digital_silence',
+        'depth_dbfs': -120.0,
+    })
+    monkeypatch.setattr(
+        processing, 'snap_extended_ad_tails_to_splice',
+        lambda *args, **kwargs: [snapped])
+    saves = []
+    monkeypatch.setattr(
+        processing.storage, 'save_combined_ads',
+        lambda *args: saves.append(args))
+    analysis = SimpleNamespace(splice_evidence={
+        'events': [_event(2415.85)],
+        'calibration': {'status': 'calibrated'},
+    })
+
+    result = processing._snap_completed_cut_tails_to_splice(
+        'feed', 'episode', [marker], [marker], segments, analysis)
+
+    assert result[0]['end'] == 2415.85
+    assert marker['end'] == 2415.85
+    assert marker['tail_splice_snap']['event_time'] == 2415.85
+    assert len(saves) == 1

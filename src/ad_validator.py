@@ -23,11 +23,29 @@ from config import (
     HOLD_REASON_CUE_TEMPLATE_UNPROVEN, HOLD_REASON_CUE_LOW_CONFIDENCE,
     normalize_segment_category, DEFAULT_SEGMENT_ACTION,
 )
-from utils.markers import clip_dai_core_spans, dai_core_bounds, mark_distinct_merge
+from utils.markers import (
+    clip_dai_core_spans,
+    dai_core_bounds,
+    invalidate_tail_provenance,
+    mark_distinct_merge,
+)
 from utils.text import extract_text_from_segments
 from utils.time import overlap_ratio
 
 logger = logging.getLogger(__name__)
+
+
+def _adopt_later_marker_end(target: Dict, source: Dict) -> None:
+    """Extend a merged marker and carry provenance only from its new edge."""
+    if source['end'] <= target['end']:
+        return
+    invalidate_tail_provenance(target, source['end'])
+    target['end'] = source['end']
+    if source.get('end_extended_by_content'):
+        target['end_extended_by_content'] = True
+    if source.get('tail_splice_snap') is not None:
+        snap = source['tail_splice_snap']
+        target['tail_splice_snap'] = dict(snap) if isinstance(snap, dict) else snap
 
 
 class Decision(Enum):
@@ -387,12 +405,57 @@ class AdValidator:
         for ad in ads:
             ad['_matches_false_positive_correction'] = (
                 self._overlaps_false_positive(ad['start'], ad['end']))
+            confirmed = self._matching_confirmed(ad['start'], ad['end'])
             core_start, core_end = dai_core_bounds(ad)
-            if ((core_start is not None and core_start < ad['start'])
-                    or (core_end is not None and core_end > ad['end'])):
-                confirmed = self._matching_confirmed(ad['start'], ad['end'])
-                if confirmed is not None:
-                    ad['_pre_dai_restore_confirmed_correction'] = confirmed
+            dai_will_expand = (
+                (core_start is not None and core_start < ad['start'])
+                or (core_end is not None and core_end > ad['end']))
+            # Exact human-approved spans survive every automatic expansion,
+            # including tiny-gap merges and trailing extension. A plain
+            # confirmation is carried only across measured DAI restoration;
+            # allowing it across unrelated growth would authorize new audio.
+            if (confirmed is not None
+                    and (confirmed.get('confirmed_span') or dai_will_expand)):
+                ad['_pre_dai_restore_confirmed_correction'] = confirmed
+
+        # A single approved span can overlap several fragments from one DAI
+        # re-detection. Each would later restore to that exact same span, so
+        # retain only the first eligible overlapping fragment before merge
+        # protection keeps them separate. Judge false-positive overlap against
+        # the prospective restored DAI bounds: otherwise a retained fragment
+        # can expand into user-kept content and be rejected after consuming
+        # the approved span. Fragments in user-kept content or rejected as
+        # false positives still need normal validation and must not consume
+        # the approved-span match.
+        restored_corrections = set()
+        deduplicated_ads = []
+        for ad in ads:
+            confirmed = ad.get('_pre_dai_restore_confirmed_correction')
+            span = confirmed.get('confirmed_span') if confirmed else None
+            overlaps_approved = (span is not None
+                                 and ad['start'] < span['end']
+                                 and ad['end'] > span['start'])
+            core_start, core_end = dai_core_bounds(ad)
+            restored_start = (
+                min(ad['start'], core_start)
+                if core_start is not None else ad['start'])
+            restored_end = (
+                max(ad['end'], core_end)
+                if core_end is not None else ad['end'])
+            restored_start = max(0.0, restored_start)
+            if self.episode_duration > 0:
+                restored_end = min(restored_end, self.episode_duration)
+            correction_id = id(confirmed)
+            can_restore_approved_span = (
+                overlaps_approved
+                and not self._overlaps_false_positive(restored_start, restored_end))
+            if (can_restore_approved_span
+                    and correction_id in restored_corrections):
+                continue
+            if can_restore_approved_span:
+                restored_corrections.add(correction_id)
+            deduplicated_ads.append(ad)
+        ads = deduplicated_ads
 
         # Step 1: Auto-correct boundaries
         ads = self._clamp_boundaries(ads, result)
@@ -463,7 +526,6 @@ class AdValidator:
             '_matches_false_positive_correction', False)
         pre_restore_confirmed = ad.pop(
             '_pre_dai_restore_confirmed_correction', None)
-        matched_before_dai_restore = pre_restore_confirmed is not None
         if (matched_false_positive
                 or self._overlaps_false_positive(ad['start'], ad['end'])):
             flags.append("INFO: User marked as false positive")
@@ -485,56 +547,36 @@ class AdValidator:
         confirmed = (pre_restore_confirmed
                      or self._matching_confirmed(ad['start'], ad['end']))
         if confirmed is not None:
-            # A trimmed approval confirmed only a sub-span as ad. Pull a
-            # boundary inward only when it falls in a trimmed-out zone (inside
-            # the reviewed original bounds but outside the approved span) so
-            # the content the user explicitly kept is never re-cut; parts of
-            # the detection beyond the reviewed bounds are new territory and
-            # are left alone.
+            # A trimmed approval confirms exactly one sub-span as ad. A later
+            # detection can be wider, but that must neither authorize the new
+            # territory nor prevent the known-positive span from being cut.
             span = confirmed.get('confirmed_span')
             auto_accept = True
             if span:
-                new_start, new_end = ad['start'], ad['end']
                 approved_start = max(0.0, span['start'])
                 approved_end = span['end']
                 if self.episode_duration > 0:
                     approved_end = min(approved_end, self.episode_duration)
                 overlaps_approved = (
-                    new_start < approved_end and new_end > approved_start)
-                if matched_before_dai_restore:
-                    # This correction matched the narrower span before a
-                    # persisted DAI core widened it. The confirmed span is
-                    # therefore authoritative over every restored edge.
-                    new_start = max(new_start, approved_start)
-                    new_end = min(new_end, approved_end)
-                else:
-                    if confirmed['start'] <= new_start < approved_start:
-                        new_start = approved_start
-                    if approved_end < new_end <= confirmed['end']:
-                        new_end = approved_end
-                    if overlaps_approved:
-                        # Every part of confirmed_span was explicitly approved
-                        # as ad audio. A later narrower detection must not
-                        # leave part of that known-positive span behind.
-                        new_start = min(new_start, approved_start)
-                        new_end = max(new_end, approved_end)
-                if new_end <= new_start:
+                    ad['start'] < approved_end and ad['end'] > approved_start)
+                if not overlaps_approved or approved_end <= approved_start:
                     # The detection lies entirely inside user-kept content;
                     # do not auto-accept -- let normal validation judge it.
                     auto_accept = False
-                elif (new_start, new_end) != (ad['start'], ad['end']):
+                elif (approved_start, approved_end) != (ad['start'], ad['end']):
                     logger.info(
                         f"Clamping confirmed segment {ad['start']:.1f}s-{ad['end']:.1f}s "
-                        f"to user-approved span {new_start:.1f}s-{new_end:.1f}s"
+                        f"to user-approved span {approved_start:.1f}s-{approved_end:.1f}s"
                     )
                     flags.append("INFO: Clamped to user-approved span")
-                    ad['start'] = new_start
-                    ad['end'] = new_end
+                    invalidate_tail_provenance(ad, approved_end)
+                    ad['start'] = approved_start
+                    ad['end'] = approved_end
                     # Human trims are authoritative. A measured DAI core may
                     # have been clipped to the wider detected bounds earlier;
                     # keep it inside the approved span so the reviewer cannot
                     # later widen the marker back into user-kept content.
-                    clip_dai_core_spans(ad, new_start, new_end)
+                    clip_dai_core_spans(ad, approved_start, approved_end)
             if auto_accept:
                 approved = span or confirmed
                 tolerance = 0.01
@@ -1162,7 +1204,7 @@ class AdValidator:
             if 0 <= gap < MERGE_GAP_THRESHOLD:
                 # Always merge small gaps (< 5s)
                 mark_distinct_merge(last, current)
-                last['end'] = max(last['end'], current['end'])
+                _adopt_later_marker_end(last, current)
                 if current.get('reason') and current['reason'] != last.get('reason'):
                     last['reason'] = f"{last.get('reason', '')} + {current['reason']}"
                 if current.get('confidence', 0) > last.get('confidence', 0):
@@ -1173,7 +1215,7 @@ class AdValidator:
             elif 0 <= gap < MAX_SILENT_GAP and not self._has_speech_in_range(last['end'], current['start']):
                 # Merge larger gaps if no speech in between
                 mark_distinct_merge(last, current)
-                last['end'] = max(last['end'], current['end'])
+                _adopt_later_marker_end(last, current)
                 if current.get('reason') and current['reason'] != last.get('reason'):
                     last['reason'] = f"{last.get('reason', '')} + {current['reason']}"
                 if current.get('confidence', 0) > last.get('confidence', 0):
