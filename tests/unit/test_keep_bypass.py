@@ -14,6 +14,8 @@ import tempfile
 import types
 from contextlib import ExitStack
 
+import pytest
+
 os.environ.setdefault('MINUSPOD_DATA_DIR', tempfile.mkdtemp(prefix='keepbypass_test_'))
 os.environ.setdefault('SECRET_KEY', 'test-secret')
 
@@ -596,6 +598,273 @@ class TestStampPass2MarkerCategories:
 
         assert markers[0]['category'] == 'cross_promo'
         assert 'category' not in markers[1]
+
+
+class TestPartitionPass2CategoryActions:
+    ACTIONS = {
+        'sponsor': 'remove',
+        'cross_promo': 'remove',
+        'self_promo': 'keep',
+        'interaction': 'keep',
+        'intro': 'keep',
+        'outro': 'beep',
+        'recap': 'keep',
+    }
+
+    @staticmethod
+    def _pair(category, **extra):
+        processed = {'start': 10.0, 'end': 20.0, 'category': category, **extra}
+        original = {'start': 110.0, 'end': 120.0, 'category': category, **extra}
+        return processed, original
+
+    def test_keep_action_removes_pair_from_cut_pipeline(self):
+        processed, original = self._pair(
+            'self_promo', held_for_review=True, hold_reason='max_duration')
+
+        out_p, out_o, kept = processing._partition_pass2_category_actions(
+            [processed], [original], self.ACTIONS)
+
+        assert out_p == []
+        assert out_o == []
+        assert kept == [original]
+        for marker in (processed, original):
+            assert marker['action_applied'] == 'keep'
+            assert marker['was_cut'] is False
+            assert marker['held_for_review'] is False
+            assert marker['hold_cleared_reason'] == 'max_duration'
+            assert 'hold_reason' not in marker
+
+    @pytest.mark.parametrize(
+        ('category', 'expected'), [('sponsor', 'remove'), ('outro', 'beep')])
+    def test_cut_actions_are_delayed_until_candidate_reaches_recut(
+            self, category, expected):
+        processed, original = self._pair(category)
+
+        out_p, out_o, kept = processing._partition_pass2_category_actions(
+            [processed], [original], self.ACTIONS)
+
+        assert out_p == [processed]
+        assert out_o == [original]
+        assert kept == []
+        assert 'action_applied' not in processed
+        assert 'action_applied' not in original
+
+        processing._stamp_pass2_cut_actions(out_p, out_o, self.ACTIONS)
+
+        assert processed['action_applied'] == expected
+        assert original['action_applied'] == expected
+
+    def test_defined_pattern_overrides_keep(self):
+        processed, original = self._pair('self_promo', pattern_defined=True)
+
+        out_p, out_o, kept = processing._partition_pass2_category_actions(
+            [processed], [original], self.ACTIONS)
+
+        assert out_p == [processed]
+        assert out_o == [original]
+        assert kept == []
+        for marker in (processed, original):
+            assert 'action_applied' not in marker
+            assert marker['keep_overridden_by_pattern'] is True
+
+        processing._stamp_pass2_cut_actions(out_p, out_o, self.ACTIONS)
+        assert processed['action_applied'] == 'remove'
+        assert original['action_applied'] == 'remove'
+
+    def test_missing_category_uses_conservative_sponsor_action(self):
+        processed = {'start': 10.0, 'end': 20.0}
+        original = {'start': 110.0, 'end': 120.0}
+
+        out_p, out_o, kept = processing._partition_pass2_category_actions(
+            [processed], [original], self.ACTIONS)
+
+        assert out_p == [processed]
+        assert out_o == [original]
+        assert kept == []
+        assert 'action_applied' not in processed
+        assert 'action_applied' not in original
+
+        processing._stamp_pass2_cut_actions(out_p, out_o, self.ACTIONS)
+        assert processed['action_applied'] == 'remove'
+        assert original['action_applied'] == 'remove'
+
+    def test_run_verification_persists_keep_without_recut(self):
+        ctx = types.SimpleNamespace(
+            slug='pass2-actions', episode_id='ep1', podcast_id=1,
+            podcast_name='Test Show', episode_title='Episode',
+            episode_description=None, podcast_description=None,
+        )
+        processed, original = self._pair('self_promo')
+        audio_processor = types.SimpleNamespace()
+
+        with ExitStack() as stack:
+            db = stack.enter_context(patch.object(processing, 'db'))
+            stack.enter_context(patch.object(processing, 'storage'))
+            stack.enter_context(patch.object(
+                processing, '_apply_pass2_heuristic_rolls'))
+            verifier_cls = stack.enter_context(
+                patch('verification_pass.VerificationPass'))
+            verifier_cls.return_value.verify.return_value = {
+                'ads': [original],
+                'ads_processed': [processed],
+                'segments': SEGMENTS,
+                'status': 'success',
+            }
+            db.get_setting_float.return_value = 0.6
+
+            result = processing._run_verification_pass(
+                ctx, '/tmp/pass2-actions.mp3', [], False, 0.8,
+                audio_processor, None, segment_actions=self.ACTIONS,
+            )
+
+        assert result[0] == 0
+        assert result[1] == []
+        assert result[3] == [original]
+        assert result[4] == '/tmp/pass2-actions.mp3'
+        assert result[6] is True
+        assert original['action_applied'] == 'keep'
+        assert original['was_cut'] is False
+
+    def test_pass1_keep_overlap_is_diverted_before_category_keep_partition(self):
+        ctx = types.SimpleNamespace(
+            slug='pass2-actions', episode_id='ep1', podcast_id=1,
+            podcast_name='Test Show', episode_title='Episode',
+            episode_description=None, podcast_description=None,
+        )
+        processed = {
+            'start': 110.0, 'end': 120.0, 'confidence': 0.95,
+            'category': 'self_promo',
+        }
+        original = dict(processed)
+
+        with ExitStack() as stack:
+            db = stack.enter_context(patch.object(processing, 'db'))
+            stack.enter_context(patch.object(processing, 'storage'))
+            stack.enter_context(patch.object(
+                processing, '_apply_pass2_heuristic_rolls'))
+            verifier_cls = stack.enter_context(
+                patch('verification_pass.VerificationPass'))
+            verifier_cls.return_value.verify.return_value = {
+                'ads': [original],
+                'ads_processed': [processed],
+                'segments': SEGMENTS,
+                'status': 'success',
+            }
+            db.get_setting_float.return_value = 0.6
+
+            result = processing._run_verification_pass(
+                ctx, '/tmp/pass2-actions.mp3', [], False, 0.8,
+                types.SimpleNamespace(), None,
+                pass1_kept_markers=[{
+                    'start': 110.0, 'end': 120.0,
+                    'action_applied': 'keep',
+                }],
+                segment_actions=self.ACTIONS,
+            )
+
+        assert result[1] == []
+        assert result[3] == [original]
+        assert original['hold_reason'] == 'verification_kept_conflict'
+        assert 'action_applied' not in original
+
+    def test_validation_expansion_into_pass1_keep_is_diverted_before_gate(self):
+        """A pass-2 span can cross a keep only after validation extends it."""
+        ctx = types.SimpleNamespace(
+            slug='pass2-actions', episode_id='ep1', podcast_id=1,
+            podcast_name='Test Show', episode_title='Episode',
+            episode_description=None, podcast_description=None,
+        )
+        candidate = {
+            'start': 100.0, 'end': 110.0, 'confidence': 0.95,
+            'category': 'sponsor',
+        }
+        original = dict(candidate)
+        validated_candidate = {**candidate, 'end': 120.0}
+        audio_processor = types.SimpleNamespace(
+            get_audio_duration=lambda _path: 200.0)
+
+        with ExitStack() as stack:
+            db = stack.enter_context(patch.object(processing, 'db'))
+            stack.enter_context(patch.object(processing, 'storage'))
+            stack.enter_context(patch.object(
+                processing, '_apply_pass2_heuristic_rolls'))
+            stack.enter_context(patch.object(
+                processing, '_validate_verification_ads',
+                return_value=([validated_candidate], [original])))
+            verifier_cls = stack.enter_context(
+                patch('verification_pass.VerificationPass'))
+            verifier_cls.return_value.verify.return_value = {
+                'ads': [original],
+                'ads_processed': [candidate],
+                'segments': SEGMENTS,
+                'status': 'success',
+            }
+            db.get_setting_float.return_value = 0.6
+
+            result = processing._run_verification_pass(
+                ctx, '/tmp/pass2-actions.mp3', [], False, 0.8,
+                audio_processor, None,
+                pass1_kept_markers=[{
+                    'start': 115.0, 'end': 125.0,
+                    'action_applied': 'keep',
+                }],
+                segment_actions=self.ACTIONS,
+            )
+
+        assert result[0] == 0
+        assert result[1] == []
+        assert result[3] == [original]
+        assert original['held_for_review'] is True
+        assert original['hold_reason'] == 'verification_kept_conflict'
+
+    def test_validation_expansion_into_category_keep_is_diverted_before_gate(self):
+        """A validated span must not cross a category-kept pass-2 marker."""
+        ctx = types.SimpleNamespace(
+            slug='pass2-actions', episode_id='ep1', podcast_id=1,
+            podcast_name='Test Show', episode_title='Episode',
+            episode_description=None, podcast_description=None,
+        )
+        candidate = {
+            'start': 100.0, 'end': 110.0, 'confidence': 0.95,
+            'category': 'sponsor',
+        }
+        original = dict(candidate)
+        category_keep = {
+            'start': 115.0, 'end': 125.0, 'confidence': 0.95,
+            'category': 'self_promo',
+        }
+        validated_candidate = {**candidate, 'end': 120.0}
+        audio_processor = types.SimpleNamespace(
+            get_audio_duration=lambda _path: 200.0)
+
+        with ExitStack() as stack:
+            db = stack.enter_context(patch.object(processing, 'db'))
+            stack.enter_context(patch.object(processing, 'storage'))
+            stack.enter_context(patch.object(
+                processing, '_apply_pass2_heuristic_rolls'))
+            stack.enter_context(patch.object(
+                processing, '_validate_verification_ads',
+                return_value=([validated_candidate], [original])))
+            verifier_cls = stack.enter_context(
+                patch('verification_pass.VerificationPass'))
+            verifier_cls.return_value.verify.return_value = {
+                'ads': [original, category_keep],
+                'ads_processed': [candidate, category_keep],
+                'segments': SEGMENTS,
+                'status': 'success',
+            }
+            db.get_setting_float.return_value = 0.6
+
+            result = processing._run_verification_pass(
+                ctx, '/tmp/pass2-actions.mp3', [], False, 0.8,
+                audio_processor, None, segment_actions=self.ACTIONS,
+            )
+
+        assert result[0] == 0
+        assert result[1] == []
+        assert result[3] == [category_keep, original]
+        assert original['held_for_review'] is True
+        assert original['hold_reason'] == 'verification_kept_conflict'
 
 
 def test_dedupe_pass2_markers_collapses_repeats():
