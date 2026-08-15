@@ -572,6 +572,15 @@ def test_affirms_ad_requires_assertion_shape():
     assert not reasoning_affirms_ad("")
 
 
+def test_affirmation_scans_past_an_earlier_negated_match():
+    reason = (
+        'None are ads in the host introduction, but the two inserted spots '
+        'are ads and should be removed.'
+    )
+
+    assert reasoning_affirms_ad(reason)
+
+
 NEGATED_PHRASE_REASONS = [
     'This is not a genuine ad break; it contains no ad content and is a '
     'false positive from the pattern matcher.',
@@ -605,6 +614,131 @@ def test_gerund_affirmation_with_trim_note_is_not_contradiction():
         'however, is not advertising and should be excluded.')
     assert reasoning_affirms_ad(reason)
     assert not reasoning_contradicts_cut(reason)
+
+
+def test_elliptical_plural_affirmation_with_trim_is_not_contradiction():
+    reason = (
+        '  Multiple Norwegian ads with clear calls to action and URLs. '
+        'Adjusted start to exclude the host sign-off, which is not an ad.'
+    )
+    assert reasoning_affirms_ad(reason)
+    assert not reasoning_contradicts_cut(reason)
+
+
+def test_negated_elliptical_plural_is_a_contradiction():
+    reason = (
+        '  Several potential ads are not an ad and should be excluded from '
+        'the cut.')
+    assert not reasoning_affirms_ad(reason)
+    assert reasoning_contradicts_cut(reason)
+
+
+def test_indirectly_negated_elliptical_plural_is_a_contradiction():
+    reason = (
+        'Several potential ads appear to be not an ad and should be '
+        'excluded from the cut.')
+    assert not reasoning_affirms_ad(reason)
+    assert reasoning_contradicts_cut(reason)
+
+
+@pytest.mark.parametrize('reason', [
+    'Several potential ads should be excluded because this is not advertising.',
+    'Multiple ads are excluded from the cut since the span is not an ad.',
+])
+def test_trailing_negation_without_boundary_adjustment_is_a_contradiction(reason):
+    assert not reasoning_affirms_ad(reason)
+    assert reasoning_contradicts_cut(reason)
+
+
+@pytest.mark.parametrize('reason', [
+    'Several potential ads adjusted the end, but none are ads; the entire '
+    'span is not advertising.',
+    'Multiple ads moved the start, but they are not ads and should be kept.',
+])
+def test_boundary_wording_does_not_mask_whole_span_negation(reason):
+    assert not reasoning_affirms_ad(reason)
+    assert reasoning_contradicts_cut(reason)
+
+
+def test_user_confirmed_ad_bypasses_automated_reviewer():
+    reviewer = _build_reviewer({
+        'review_prompt': 'review', 'resurrect_prompt': 'resurrect',
+    })
+    ad = {
+        'start': 120.0,
+        'end': 180.0,
+        'confidence': 0.95,
+        'reason': 'Human-confirmed DAI block',
+        'validation': {'decision': 'ACCEPT', 'user_confirmed': True},
+    }
+
+    result = reviewer.review(
+        accepted_ads=[ad], resurrection_eligible=[],
+        segments=_mock_segments(), episode_meta=_mock_episode_meta(),
+        pass_num=1, pass_model='claude-test',
+    )
+
+    assert result.accepted_after_review == [ad]
+    assert result.verdicts == []
+    reviewer._llm_client.messages_create.assert_not_called()
+
+
+def test_user_confirmed_bypass_preserves_mixed_concurrent_order():
+    reviewer = _build_reviewer({
+        'review_prompt': 'review', 'resurrect_prompt': 'resurrect',
+    })
+    reviewer._llm_client.messages_create.return_value = _resp(
+        '[{"start": 240.0, "end": 300.0, "confidence": 0.95, '
+        '"reason": "This is a paid ad"}]')
+    confirmed = {
+        'start': 120.0,
+        'end': 180.0,
+        'confidence': 0.95,
+        'reason': 'Human-confirmed DAI block',
+        'validation': {'decision': 'ACCEPT', 'user_confirmed': True},
+    }
+    normal = {
+        'start': 240.0,
+        'end': 300.0,
+        'confidence': 0.95,
+        'reason': 'Paid sponsor read',
+    }
+
+    with patch('ad_reviewer._resolve_reviewer_parallel_ads', return_value=2):
+        result = reviewer.review(
+            accepted_ads=[confirmed, normal], resurrection_eligible=[],
+            segments=_mock_segments(), episode_meta=_mock_episode_meta(),
+            pass_num=1, pass_model='claude-test',
+        )
+
+    assert result.accepted_after_review == [confirmed, normal]
+    assert len(result.verdicts) == 1
+    assert result.verdicts[0].original_start == 240.0
+    reviewer._llm_client.messages_create.assert_called_once()
+
+
+def test_untrusted_top_level_confirm_flag_does_not_bypass_reviewer():
+    reviewer = _build_reviewer({
+        'review_prompt': 'review', 'resurrect_prompt': 'resurrect',
+    })
+    reviewer._llm_client.messages_create.return_value = _resp('[]')
+    ad = {
+        'start': 120.0,
+        'end': 180.0,
+        'confidence': 0.95,
+        'reason': 'Model-produced marker',
+        'user_confirmed': True,
+    }
+
+    result = reviewer.review(
+        accepted_ads=[ad], resurrection_eligible=[],
+        segments=_mock_segments(), episode_meta=_mock_episode_meta(),
+        pass_num=1, pass_model='claude-test',
+    )
+
+    assert result.accepted_after_review == []
+    assert result.verdicts[0].verdict == 'reject'
+    reviewer._llm_client.messages_create.assert_called_once()
 
 
 @pytest.mark.parametrize("reason", NEGATED_PHRASE_REASONS)
@@ -667,6 +801,27 @@ def test_affirmed_confirm_with_trim_language_applies_recovered_trim():
     assert verdict.adjusted_end == pytest.approx(1040.9)
 
 
+def test_reviewer_end_adjustment_clears_stale_tail_eligibility():
+    ad = {
+        'start': 837.2,
+        'end': 1068.5,
+        'confidence': 0.95,
+        'end_extended_by_content': True,
+        'tail_splice_snap': {'event_time': 1068.5},
+    }
+    result, _ = _run_affirmed_confirm(
+        _resp('{"ad_start": 837.2, "ad_end": 1040.9}'), ad=ad)
+
+    accepted = result.accepted_after_review[0]
+    assert 'end_extended_by_content' not in accepted
+    assert 'tail_splice_snap' not in accepted
+
+    processing._apply_reviewer_verdict_to_ad(ad, result.verdicts[0])
+    assert ad['end'] == pytest.approx(1040.9)
+    assert 'end_extended_by_content' not in ad
+    assert 'tail_splice_snap' not in ad
+
+
 def test_affirmed_confirm_with_move_phrasing_applies_recovered_trim():
     # DTNS_OUTRO_REASONING affirms the span IS an ad while describing the
     # boundary move in assertion phrasing ("should move to") rather than
@@ -701,3 +856,36 @@ def test_affirmed_confirm_recovery_failure_accepts_unchanged():
     assert accepted['start'] == 837.2
     assert accepted['end'] == 1068.5
     assert result.verdicts[0].verdict == 'confirmed'
+
+
+def test_dai_core_that_erases_recovered_trim_accepts_unchanged():
+    ad = {
+        'start': 100.0, 'end': 200.0, 'confidence': 0.95,
+        'detection_stage': 'dai_differential',
+        'dai_core_spans': [{'start': 100.0, 'end': 200.0}],
+    }
+
+    result, llm = _run_affirmed_confirm(
+        _resp('{"ad_start": 120.0, "ad_end": 180.0}'), ad=ad)
+
+    assert llm.messages_create.call_count == 2
+    assert result.held_by_contradiction == []
+    accepted = result.accepted_after_review[0]
+    assert (accepted['start'], accepted['end']) == (100.0, 200.0)
+    assert result.verdicts[0].verdict == 'confirmed'
+
+
+def test_dai_core_widens_tiny_recovered_span_before_duration_floor():
+    ad = {
+        'start': 100.0, 'end': 200.0, 'confidence': 0.95,
+        'detection_stage': 'dai_differential',
+        'dai_core_spans': [{'start': 120.0, 'end': 150.0}],
+    }
+
+    result, llm = _run_affirmed_confirm(
+        _resp('{"ad_start": 130.0, "ad_end": 135.0}'), ad=ad)
+
+    assert llm.messages_create.call_count == 2
+    accepted = result.accepted_after_review[0]
+    assert (accepted['start'], accepted['end']) == (120.0, 150.0)
+    assert result.verdicts[0].verdict == 'adjust'

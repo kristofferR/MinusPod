@@ -414,18 +414,19 @@ class PatternMixin:
                                         bounds_start: float, bounds_end: float) -> int:
         """Delete corrections that conflict with a new correction being submitted.
 
-        When user confirms an ad, delete false_positive corrections for same bounds.
+        When user confirms or adjusts an ad, delete false_positive corrections
+        for the same bounds.
         When user rejects an ad, delete confirm corrections for same bounds.
 
         Returns number of deleted rows.
         """
         # Determine the conflicting type
-        if correction_type == 'confirm':
+        if correction_type in ('confirm', 'boundary_adjustment'):
             conflicting_type = 'false_positive'
         elif correction_type == 'false_positive':
             conflicting_type = 'confirm'
         else:
-            return 0  # adjust doesn't conflict with either
+            return 0
 
         conn = self.get_connection()
         cursor = conn.execute(
@@ -476,13 +477,13 @@ class PatternMixin:
         return [dict(row) for row in cursor.fetchall()]
 
     def get_episode_corrections(self, episode_id: str) -> List[Dict]:
-        """Get all corrections for a specific episode."""
+        """Get all corrections for a specific episode, newest first."""
         conn = self.get_connection()
         cursor = conn.execute(
             """SELECT id, correction_type, original_bounds, corrected_bounds, created_at
                FROM pattern_corrections
                WHERE episode_id = ?
-               ORDER BY created_at DESC""",
+               ORDER BY id DESC""",
             (episode_id,)
         )
         results = []
@@ -547,15 +548,18 @@ class PatternMixin:
     def get_confirmed_corrections(self, episode_id: str) -> List[Dict]:
         """Get confirmed corrections for an episode with parsed bounds.
 
-        Returns list of dicts with 'start' and 'end' keys for easy overlap
-        checking. A trimmed approval (confirm with corrected_bounds) also
-        carries a 'confirmed_span' dict -- the sub-span the user actually
-        confirmed as ad -- so the validator can clamp a re-detected span to it.
+        Results are newest first so the latest user decision wins when
+        corrections overlap. Both confirm and boundary_adjustment keep an ad;
+        a trimmed confirm or boundary adjustment also carries the exact
+        user-approved bounds in ``confirmed_span``.
         """
         conn = self.get_connection()
         cursor = conn.execute(
-            """SELECT original_bounds, corrected_bounds FROM pattern_corrections
-               WHERE episode_id = ? AND correction_type = 'confirm'""",
+            """SELECT correction_type, original_bounds, corrected_bounds
+               FROM pattern_corrections
+               WHERE episode_id = ?
+                 AND correction_type IN ('confirm', 'boundary_adjustment')
+               ORDER BY id DESC""",
             (episode_id,)
         )
         results = []
@@ -563,6 +567,9 @@ class PatternMixin:
             bounds = _parse_bounds(row['original_bounds'])
             if bounds:
                 confirmed_span = _parse_bounds(row['corrected_bounds'])
+                if (row['correction_type'] == 'boundary_adjustment'
+                        and not confirmed_span):
+                    continue
                 if confirmed_span:
                     bounds['confirmed_span'] = confirmed_span
                 results.append(bounds)

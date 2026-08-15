@@ -48,7 +48,12 @@ def test_best_overlap_ad_excludes_ids():
 
 
 def test_apply_boundary_adjustments_overrides_bounds(monkeypatch):
-    ads = [{'start': 100.0, 'end': 160.0, 'confidence': 0.9}]
+    ads = [{
+        'start': 100.0,
+        'end': 160.0,
+        'confidence': 0.9,
+        'dai_core_spans': [{'start': 100.0, 'end': 160.0}],
+    }]
     corrections = [{
         'correction_type': 'boundary_adjustment',
         'original_bounds': {'start': 100.0, 'end': 160.0},
@@ -58,6 +63,7 @@ def test_apply_boundary_adjustments_overrides_bounds(monkeypatch):
     processing._apply_boundary_adjustments('slug', 'ep', ads)
     assert ads[0]['start'] == 105.0
     assert ads[0]['end'] == 150.0
+    assert ads[0]['dai_core_spans'] == [{'start': 105.0, 'end': 150.0}]
 
 
 def test_apply_boundary_adjustments_skips_unmatched(monkeypatch):
@@ -88,6 +94,223 @@ def test_apply_boundary_adjustments_newest_wins(monkeypatch):
     processing._apply_boundary_adjustments('slug', 'ep', ads)
     assert ads[0]['start'] == 110.0
     assert ads[0]['end'] == 150.0
+
+
+def test_final_confirmed_bounds_sync_cut_and_master(monkeypatch):
+    cut = {
+        'start': 1361.5,
+        'end': 1406.753,
+        'confidence': 0.95,
+        'dai_core_spans': [{'start': 1361.5, 'end': 1406.4}],
+        'end_extended_by_content': True,
+        'tail_splice_snap': {'event_time': 1407.5},
+        'validation': {
+            'decision': 'ACCEPT',
+            'user_confirmed': True,
+            'flags': ['INFO: User confirmed as ad'],
+        },
+    }
+    master = dict(cut)
+    master['validation'] = dict(cut['validation'])
+    master['validation']['flags'] = list(cut['validation']['flags'])
+    corrections = [{
+        'start': 1361.654,
+        'end': 1409.104,
+        'confirmed_span': {'start': 1361.5, 'end': 1408.93},
+    }]
+    saves = []
+    monkeypatch.setattr(
+        processing.storage, 'save_combined_ads',
+        lambda *args: saves.append(args))
+
+    result = processing._finalize_user_confirmed_bounds(
+        'feed', 'episode', [cut], [master], corrections)
+
+    assert result[0]['start'] == 1361.5
+    assert result[0]['end'] == 1408.93
+    assert master['start'] == 1361.5
+    assert master['end'] == 1408.93
+    assert result[0]['dai_core_spans'] == [
+        {'start': 1361.5, 'end': 1406.4}]
+    assert 'end_extended_by_content' not in result[0]
+    assert 'tail_splice_snap' not in result[0]
+    assert 'INFO: Finalized to user-approved span' in (
+        master['validation']['flags'])
+    assert len(saves) == 1
+
+
+def test_final_confirmed_bounds_ignores_untrusted_marker(monkeypatch):
+    marker = {
+        'start': 1361.5,
+        'end': 1406.753,
+        'validation': {'decision': 'ACCEPT', 'flags': []},
+    }
+    corrections = [{
+        'start': 1361.654,
+        'end': 1409.104,
+        'confirmed_span': {'start': 1361.5, 'end': 1408.93},
+    }]
+    monkeypatch.setattr(
+        processing.storage, 'save_combined_ads',
+        lambda *args: pytest.fail('unchanged markers must not be persisted'))
+
+    processing._finalize_user_confirmed_bounds(
+        'feed', 'episode', [marker], [marker], corrections)
+
+    assert marker['end'] == 1406.753
+
+
+def test_final_confirmed_bounds_uses_carried_span_after_large_extension(monkeypatch):
+    marker = {
+        'start': 101.0,
+        'end': 141.0,
+        'validation': {
+            'decision': 'ACCEPT',
+            'user_confirmed': True,
+            'confirmed_span': {'start': 101.0, 'end': 111.0},
+            'flags': [],
+        },
+    }
+    corrections = [{
+        'start': 100.0,
+        'end': 112.0,
+        'confirmed_span': {'start': 101.0, 'end': 111.0},
+    }]
+    monkeypatch.setattr(processing.storage, 'save_combined_ads', lambda *args: None)
+
+    processing._finalize_user_confirmed_bounds(
+        'feed', 'episode', [marker], [marker], corrections)
+
+    assert marker['start'] == 101.0
+    assert marker['end'] == 111.0
+
+
+def test_final_confirmed_bounds_does_not_restore_older_trim_after_new_plain_confirm(
+        monkeypatch):
+    marker = {
+        'start': 100.0,
+        'end': 200.0,
+        'validation': {
+            'decision': 'ACCEPT',
+            'user_confirmed': True,
+            'flags': [],
+        },
+    }
+    corrections = [
+        {'start': 100.0, 'end': 200.0},
+        {
+            'start': 100.0,
+            'end': 200.0,
+            'confirmed_span': {'start': 120.0, 'end': 180.0},
+        },
+    ]
+    monkeypatch.setattr(
+        processing.storage, 'save_combined_ads',
+        lambda *args: pytest.fail('newest plain confirm must keep its bounds'))
+
+    processing._finalize_user_confirmed_bounds(
+        'feed', 'episode', [marker], [marker], corrections)
+
+    assert marker['start'] == 100.0
+    assert marker['end'] == 200.0
+
+
+def test_final_confirmed_bounds_clamps_carried_span_to_episode(monkeypatch):
+    marker = {
+        'start': 101.0,
+        'end': 111.0,
+        'validation': {
+            'decision': 'ACCEPT',
+            'user_confirmed': True,
+            'confirmed_span': {'start': 101.0, 'end': 111.0},
+            'flags': [],
+        },
+    }
+    monkeypatch.setattr(processing.storage, 'save_combined_ads', lambda *args: None)
+
+    processing._finalize_user_confirmed_bounds(
+        'feed', 'episode', [marker], [marker], [], episode_duration=105.0)
+
+    assert marker['start'] == 101.0
+    assert marker['end'] == 105.0
+
+
+def test_final_confirmed_bounds_persists_metadata_only_cleanup(monkeypatch):
+    marker = {
+        'start': 101.0,
+        'end': 111.0,
+        'end_extended_by_content': True,
+        'tail_splice_snap': {'event_time': 111.0},
+        'dai_core_spans': [{'start': 100.0, 'end': 112.0}],
+        'validation': {
+            'decision': 'ACCEPT',
+            'user_confirmed': True,
+            'confirmed_span': {'start': 101.0, 'end': 111.0},
+            'flags': [],
+        },
+    }
+    saves = []
+    monkeypatch.setattr(
+        processing.storage, 'save_combined_ads',
+        lambda *args: saves.append(args))
+
+    processing._finalize_user_confirmed_bounds(
+        'feed', 'episode', [marker], [marker], [])
+
+    assert 'end_extended_by_content' not in marker
+    assert 'tail_splice_snap' not in marker
+    assert marker['dai_core_spans'] == [{'start': 101.0, 'end': 111.0}]
+    assert len(saves) == 1
+
+
+def test_final_confirmed_bounds_ignores_collapsed_duration_clamp(monkeypatch):
+    marker = {
+        'start': 101.0,
+        'end': 111.0,
+        'validation': {
+            'decision': 'ACCEPT',
+            'user_confirmed': True,
+            'confirmed_span': {'start': 101.0, 'end': 111.0},
+            'flags': [],
+        },
+    }
+    monkeypatch.setattr(
+        processing.storage, 'save_combined_ads',
+        lambda *args: pytest.fail('a collapsed clamp must not be persisted'))
+
+    processing._finalize_user_confirmed_bounds(
+        'feed', 'episode', [marker], [marker], [], episode_duration=100.0)
+
+    assert marker['start'] == 101.0
+    assert marker['end'] == 111.0
+
+
+def test_final_confirmed_bounds_master_fallback_requires_overlap(monkeypatch):
+    approved = {'start': 101.0, 'end': 111.0}
+
+    def marker(start, end):
+        return {
+            'start': start,
+            'end': end,
+            'validation': {
+                'decision': 'ACCEPT',
+                'user_confirmed': True,
+                'confirmed_span': approved,
+                'flags': [],
+            },
+        }
+
+    cut = marker(101.0, 141.0)
+    unrelated = marker(500.0, 510.0)
+    related_master = marker(100.0, 140.0)
+    monkeypatch.setattr(processing.storage, 'save_combined_ads', lambda *args: None)
+
+    processing._finalize_user_confirmed_bounds(
+        'feed', 'episode', [cut], [unrelated, related_master], [])
+
+    assert cut['end'] == 111.0
+    assert (related_master['start'], related_master['end']) == (101.0, 111.0)
+    assert (unrelated['start'], unrelated['end']) == (500.0, 510.0)
 
 
 def test_build_recut_ad_list_drops_rejected(monkeypatch):

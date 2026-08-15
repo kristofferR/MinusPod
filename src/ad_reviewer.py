@@ -29,6 +29,7 @@ from llm_client import (
 )
 from utils.llm_call import call_llm, call_llm_for_window
 from utils.llm_response import extract_json_ads_array, extract_json_object
+from utils.markers import dai_core_bounds, invalidate_tail_provenance
 from utils.prompt import format_sponsor_block, render_prompt, apply_override
 from utils.text import (
     BOUNDARY_SNAP_TOLERANCE_S,
@@ -62,6 +63,13 @@ def _review_failure_reason(error: Exception) -> str:
 # as "confirmed" -- hold those for review, never auto-reject. Patterns are
 # assertion-shaped regexes ("is not advertising"), not bare nouns: an
 # affirming reasoning ("not a false positive") must not trigger a hold.
+_PLURAL_NEGATION_PATTERN = (
+    r'\bnone\s+(?:of\s+(?:them|these|those)\s+)?(?:are|is)\s+'
+    r'(?:an?\s+)?ads?\b'
+    r'|\b(?:they|these|those)\s+are\s+not\s+'
+    r'(?:an?\s+)?(?:ads?|advertis\w*)\b'
+)
+
 REVIEWER_CONTRADICTION_PATTERNS = (
     r'\bcontains?\s+no\s+advertis',            # "contain(s) no advertising content"
     r'\bis\s+not\s+(?:an?\s+)?(?:paid\s+)?advertis',  # "is not advertising"
@@ -72,6 +80,7 @@ REVIEWER_CONTRADICTION_PATTERNS = (
     r'\bcontains?\s+only\s+the\s+(?:phrase|fragment|words?)\b',
     r'\btranscription\s+artifact\b',
     r'\b(?:is\s+|entirely\s+)organic\s+conversation\b',
+    _PLURAL_NEGATION_PATTERN,
 )
 
 _CONTRADICTION_RES = tuple(re.compile(p) for p in REVIEWER_CONTRADICTION_PATTERNS)
@@ -87,15 +96,28 @@ _CONTRADICTION_RES = tuple(re.compile(p) for p in REVIEWER_CONTRADICTION_PATTERN
 # growing free-text heuristic (each pattern traces to a production episode).
 # The durable fix is a structured verdict field (e.g. is_ad plus trim bounds)
 # in the review prompt contract, so intent stops hiding in prose.
+_ELLIPTICAL_AFFIRMATION_PATTERN = (
+    r'^\s*(?:multiple|several)\s+(?:[\w-]+\s+){0,2}ads?(?!-)\b')
+
 REVIEWER_AFFIRMATION_PATTERNS = (
     r'\bis\s+an?\s+ad\s+break\b',
     r'\bis\s+an?\s+(?:genuine\s+|real\s+|actual\s+|paid\s+|'
     r'dynamically\s+inserted\s+)?ad(?:vertisement)?(?!-)\b',
     r'\bare\s+(?:all\s+)?(?:genuine\s+|real\s+)?ads(?!-)\b',
     r'\bis\s+(?:genuine\s+|real\s+|paid\s+)?advertising\b',
+    # Elliptical reviewer prose often begins with the classification rather
+    # than a verb: "Multiple Norwegian ads ... adjusted start to exclude ...".
+    # This is still an explicit affirmation when paired with trim language.
+    _ELLIPTICAL_AFFIRMATION_PATTERN,
 )
 
-_AFFIRMATION_RES = tuple(re.compile(p) for p in REVIEWER_AFFIRMATION_PATTERNS)
+_AFFIRMATION_RES_BY_PATTERN = {
+    pattern: re.compile(pattern) for pattern in REVIEWER_AFFIRMATION_PATTERNS
+}
+_AFFIRMATION_RES = tuple(
+    _AFFIRMATION_RES_BY_PATTERN[p] for p in REVIEWER_AFFIRMATION_PATTERNS)
+_ELLIPTICAL_AFFIRMATION_RE = _AFFIRMATION_RES_BY_PATTERN[
+    _ELLIPTICAL_AFFIRMATION_PATTERN]
 
 # Trim-language precheck: only spend the recovery LLM call when the
 # reasoning describes a sub-span trim; plain "not an ad" skips it.
@@ -109,6 +131,27 @@ _TRIM_LANGUAGE_RE = re.compile(
     r'|\bshould\s+move\b'
     r'|\bmove[sd]?\s+(?:to|back|forward)\b'
     r'|\bexcluded?\b',
+    re.IGNORECASE,
+)
+
+# Elliptical openings ("Multiple ads ...") need stronger scoping than a
+# generic word such as "excluded".  When their prose also contains a
+# negation, only an explicit edge adjustment establishes that the negation
+# describes preserved context rather than the whole candidate.
+_EXPLICIT_BOUNDARY_TRIM_RE = re.compile(
+    r'\b(?:adjust(?:ed|ing)?|move[sd]?|shift(?:ed|ing)?|trim(?:med|ming)?)\s+'
+    r'(?:the\s+)?(?:start|end|boundar(?:y|ies))\b'
+    r'|\b(?:start|end|boundar(?:y|ies))\s+(?:was\s+)?'
+    r'(?:adjusted|moved|shifted|trimmed)\b',
+    re.IGNORECASE,
+)
+
+_WHOLE_CANDIDATE_NEGATION_RE = re.compile(
+    _PLURAL_NEGATION_PATTERN
+    + r'|\b(?:this|it|the\s+)?(?:entire\s+|whole\s+|full\s+)?'
+    r'(?:candidate|span|segment|block)\s+(?:is|contains?)\s+'
+    r'(?:not\s+(?:an?\s+ad|advertis\w*)|no\s+(?:ad|advertis\w*))\b'
+    r'|\b(?:this|it)\s+is\s+not\s+(?:an?\s+ad|advertis\w*)\b',
     re.IGNORECASE,
 )
 
@@ -133,7 +176,31 @@ def reasoning_affirms_ad(reasoning: Optional[str]) -> bool:
     if not reasoning:
         return False
     lowered = reasoning.lower()
-    return any(r.search(lowered) for r in _AFFIRMATION_RES)
+    whole_negations = list(_WHOLE_CANDIDATE_NEGATION_RE.finditer(lowered))
+    for regex in _AFFIRMATION_RES:
+        for match in regex.finditer(lowered):
+            # A broad positive phrase such as "are ads" can be a substring
+            # of the explicit denial "none are ads". Ignore that occurrence,
+            # but keep scanning in case a later assertion is affirmative.
+            if any(neg.start() <= match.start() and match.end() <= neg.end()
+                   for neg in whole_negations):
+                continue
+            if regex is _ELLIPTICAL_AFFIRMATION_RE:
+                tail = lowered[match.end():]
+                if any(neg.start() >= match.end() for neg in whole_negations):
+                    continue
+                contradiction_positions = [
+                    found.start()
+                    for contradiction in _CONTRADICTION_RES
+                    if (found := contradiction.search(tail)) is not None
+                ]
+                if contradiction_positions:
+                    boundary_trim = _EXPLICIT_BOUNDARY_TRIM_RE.search(tail)
+                    if (boundary_trim is None
+                            or min(contradiction_positions) < boundary_trim.start()):
+                        continue
+            return True
+    return False
 
 
 def reasoning_contradicts_cut(reasoning: Optional[str]) -> bool:
@@ -162,6 +229,7 @@ def _adjusted_ad_copy(ad: Dict, start: float, end: float,
     adjust paths (boundary-delta adjust, affirmed-confirm trim recovery)
     cannot drift on which fields they write."""
     updated = dict(ad)
+    invalidate_tail_provenance(updated, end)
     updated["start"] = start
     updated["end"] = end
     updated["reviewer_verdict"] = "adjust"
@@ -669,6 +737,15 @@ class AdReviewer:
             max_workers=parallel_ads,
         )
         for verdict, updated_ad in accepted_results:
+            # Human corrections are the highest-confidence signal. They are
+            # deliberately omitted from the reviewer call and retain their
+            # validated bounds and cut decision unchanged. Do not synthesize
+            # a ReviewVerdict here: ad_reviewer_log and its totalReviews stat
+            # count actual LLM calls. The persisted validation.user_confirmed
+            # field is the audit record for this human-authorized bypass.
+            if verdict is None:
+                result.accepted_after_review.append(updated_ad)
+                continue
             result.verdicts.append(verdict)
             if verdict.verdict == "reject":
                 marked = dict(updated_ad)
@@ -811,6 +888,9 @@ class AdReviewer:
             return []
 
         def _run_one(idx):
+            if (pool == "accepted"
+                    and (ads[idx].get("validation") or {}).get("user_confirmed")):
+                return None, ads[idx]
             return self._review_single(
                 ad=ads[idx],
                 pool=pool,
@@ -1072,6 +1152,23 @@ class AdReviewer:
                 )
             clamped_start, clamped_end = floor_start, floor_end
 
+        # Cross-fetch evidence remains authoritative inside a merged
+        # candidate. The reviewer may trim coarse LLM/VAD extensions outside
+        # these measured regions, but cannot leave part of an inserted block
+        # in the published episode.
+        core_start, core_end = dai_core_bounds(ad)
+        if core_start is not None:
+            floor_start = min(clamped_start, core_start)
+            floor_end = max(clamped_end, core_end)
+            if floor_start != clamped_start or floor_end != clamped_end:
+                logger.info(
+                    f"[{slug}:{episode_id}] Reviewer inward shrink clamped "
+                    f"to DAI core @ {core_start:.1f}-{core_end:.1f}s: "
+                    f"{clamped_start:.1f}-{clamped_end:.1f} -> "
+                    f"{floor_start:.1f}-{floor_end:.1f}"
+                )
+            clamped_start, clamped_end = floor_start, floor_end
+
         if clamped_end <= clamped_start:
             clamped_start, clamped_end = original_start, original_end
         return clamped_start, clamped_end
@@ -1174,16 +1271,27 @@ class AdReviewer:
         end = min(end, o_end)
         if end <= start:
             return None
-        # Must be a strict sub-span: a result that shrinks the span by less
-        # than the confirmed-boundary tolerance is indistinguishable from
-        # the full span and offers no trim worth surfacing.
+        # Widen back out to the protected union so a tracked merged ad's
+        # recovered trim cannot sever a transcript-anchored member.
+        if ad.get('merged_distinct_ads'):
+            p_start = ad.get('merged_protected_start')
+            p_end = ad.get('merged_protected_end')
+            if p_start is not None:
+                start = min(start, p_start)
+            if p_end is not None:
+                end = max(end, p_end)
+        core_start, core_end = dai_core_bounds(ad)
+        if core_start is not None:
+            start = min(start, core_start)
+            end = max(end, core_end)
+        # Protected merge members or measured DAI evidence can widen the
+        # recovered proposal back to the full marker. That is no longer a
+        # trim, so neither review path should surface it as one.
         if (start - o_start) + (o_end - end) <= _CONFIRMED_BOUNDARY_TOLERANCE_S:
             return None
-        # Sanity floor: a recovered ad portion shorter than the minimum we would
-        # ever remove from audio is more likely a hallucinated sub-span than a
-        # real trim of a span the model itself flagged as an ad. Fall back to
-        # holding without bounds (today's behavior) rather than pre-fill the
-        # review UI with a bad one-tap trim.
+        # Evaluate the render floor after protected bounds expand the model's
+        # raw proposal. A tiny proposal inside a substantial measured core is
+        # still a valid core-sized trim.
         if end - start < MIN_AD_DURATION_FOR_REMOVAL:
             logger.info(
                 f"[{slug}:{episode_id}] {call_label} recovered trim "
@@ -1196,15 +1304,6 @@ class AdReviewer:
             f"[{slug}:{episode_id}] {call_label} recovered proposed trim "
             f"{start:.1f}-{end:.1f}s from span {o_start:.1f}-{o_end:.1f}s"
         )
-        # Widen back out to the protected union so a tracked merged ad's
-        # recovered trim cannot sever a transcript-anchored member.
-        if ad.get('merged_distinct_ads'):
-            p_start = ad.get('merged_protected_start')
-            p_end = ad.get('merged_protected_end')
-            if p_start is not None:
-                start = min(start, p_start)
-            if p_end is not None:
-                end = max(end, p_end)
         return start, end
 
     @staticmethod

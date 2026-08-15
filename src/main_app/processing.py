@@ -18,7 +18,11 @@ from ad_detector import (
 from ad_detector.cue_boundary_snap import snap_ad_boundaries_to_cues
 from ad_detector.cue_pair_ads import synthesize_ads_from_cue_pairs
 from ad_detector.cue_telemetry import build_cue_detection_records
-from ad_detector.boundaries import snap_terminal_ad_to_splice
+from ad_detector.boundaries import (
+    snap_extended_ad_tails_to_splice,
+    snap_terminal_ad_to_splice,
+    transition_pair_silence_events,
+)
 from ad_detector.silence_boundary_snap import snap_ad_boundaries_to_silence
 from ad_reviewer import (
     AdReviewer, ReviewVerdict, is_contradiction_hold,
@@ -29,6 +33,7 @@ from audio_processor import get_replacement_duration, AudioProcessor
 from cancel import ProcessingCancelled, _check_cancel, _cancel_events, _cancel_events_lock
 from differential_fetcher import fetch_and_diff, is_likely_dai_feed
 from utils.audio import get_audio_codec, get_audio_duration
+from utils.markers import clip_dai_core_spans, invalidate_tail_provenance
 from utils.time import (
     adjust_timestamp, merge_cut_spans, overlap_ratio, overlap_seconds,
     ranges_overlap, span_inside_any_cut, utc_now_iso,
@@ -1638,6 +1643,7 @@ def _apply_reviewer_verdict_to_ad(ad, v):
     if v.verdict == 'adjust':
         ad['reviewer_original_start'] = v.original_start
         ad['reviewer_original_end'] = v.original_end
+        invalidate_tail_provenance(ad, v.adjusted_end)
         ad['start'] = v.adjusted_start
         ad['end'] = v.adjusted_end
     elif v.verdict == 'reject':
@@ -1757,18 +1763,36 @@ def _snap_terminal_starts(slug, episode_id, ads_to_remove, all_ads_with_validati
     if not ads_to_remove or not episode_duration:
         return ads_to_remove
     splice = getattr(audio_analysis_result, 'splice_evidence', None) or {}
-    events = splice.get('events') or []
+    events = list(splice.get('events') or [])
+    silence_tunables = getattr(
+        audio_analysis_result, 'silence_tunables', None)
+    if silence_tunables is None:
+        silence_tunables = resolve_silence_snap_tunables(db)
+    events.extend(transition_pair_silence_events(
+        getattr(audio_analysis_result, 'signals', None) or [],
+        getattr(audio_analysis_result, 'silence_spans', None) or [],
+        max_distance_s=silence_tunables['max_distance_seconds'],
+        min_silence_s=silence_tunables['min_duration_seconds'],
+    ))
     if not events:
         return ads_to_remove
     window_s = db.get_setting_float('terminal_snap_window_seconds',
                                     TERMINAL_SNAP_WINDOW_SECONDS)
-    # A kept marker must read as blocking, not as coverage, or the sweep
-    # could pull a terminal cut's start back into kept audio.
-    coverage_ads = [m for m in all_ads_with_validation
-                    if m.get('action_applied') != 'keep']
+    # Only markers that will actually be removed may make speech safe to
+    # cross. Rejected, held, and kept markers are explicit barriers, including
+    # when their audio is untranscribed.
+    coverage_ads = list(ads_to_remove)
+    cut_marker_ids = {id(marker) for marker in coverage_ads}
+    for marker in coverage_ads:
+        master = _find_master(all_ads_with_validation, marker)
+        if master is not None:
+            cut_marker_ids.add(id(master))
+    blocking_ads = [m for m in all_ads_with_validation
+                    if id(m) not in cut_marker_ids and not m.get('was_cut')]
     snapped = snap_terminal_ad_to_splice(
         ads_to_remove, segments, events, episode_duration, window_s,
-        coverage_ads=coverage_ads, podcast_name=podcast_name,
+        coverage_ads=coverage_ads, blocking_ads=blocking_ads,
+        podcast_name=podcast_name,
     )
     changed = False
     for old, new in zip(ads_to_remove, snapped):
@@ -1792,7 +1816,7 @@ def _snap_terminal_starts(slug, episode_id, ads_to_remove, all_ads_with_validati
 
 def _complete_cut_tails(slug, episode_id, ads_to_remove, all_ads_with_validation,
                         segments, podcast_name=None):
-    """Re-run content-based end extension as the last step before cutting.
+    """Re-run content-based end extension late in the pre-cut pipeline.
 
     This sweep exists to undo reviewer end-pullbacks: the reviewer can pull a
     cut's end back to the detector boundary, and the pre-reviewer extension
@@ -1842,6 +1866,154 @@ def _complete_cut_tails(slug, episode_id, ads_to_remove, all_ads_with_validation
 
     storage.save_combined_ads(slug, episode_id, all_ads_with_validation)
     return extended
+
+
+def _snap_completed_cut_tails_to_splice(
+        slug, episode_id, ads_to_remove, all_ads_with_validation,
+        segments, audio_analysis_result, podcast_name=None):
+    """Extend a recovered spoken tail through a nearby untranscribed logo."""
+    if not ads_to_remove:
+        return ads_to_remove
+    splice = getattr(audio_analysis_result, 'splice_evidence', None) or {}
+    if not isinstance(splice, dict):
+        return ads_to_remove
+    calibration = splice.get('calibration') or {}
+    if (not isinstance(calibration, dict)
+            or calibration.get('status') != 'calibrated'):
+        # Cold-start splice events may corroborate another detector, but they
+        # are not calibrated well enough to extend a destructive cut.
+        return ads_to_remove
+    events = splice.get('events') or []
+    if not isinstance(events, list) or not events:
+        return ads_to_remove
+
+    snapped = snap_extended_ad_tails_to_splice(
+        ads_to_remove, segments, events,
+        coverage_ads=all_ads_with_validation,
+        podcast_name=podcast_name,
+    )
+    changed = False
+    for old, new in zip(ads_to_remove, snapped):
+        if new['end'] <= old['end']:
+            continue
+        changed = True
+        audio_logger.info(
+            f"[{slug}:{episode_id}] Tail splice snap: cut end "
+            f"{old['end']:.1f}s -> {new['end']:.1f}s "
+            f"(+{new['end'] - old['end']:.1f}s)"
+        )
+        master = _find_master(all_ads_with_validation, old)
+        if master is not None:
+            master['end'] = new['end']
+            master['tail_splice_snap'] = new['tail_splice_snap']
+        else:
+            audio_logger.warning(
+                f"[{slug}:{episode_id}] Tail splice snap: no master ad matched "
+                f"{old['start']:.1f}s-{old['end']:.1f}s; UI list will not show "
+                f"the extension"
+            )
+
+    if changed:
+        storage.save_combined_ads(slug, episode_id, all_ads_with_validation)
+    return snapped
+
+
+def _finalize_user_confirmed_bounds(
+        slug, episode_id, ads_to_remove, all_ads_with_validation,
+        confirmed_corrections=None, episode_duration=None):
+    """Make a human-approved trim the final authority before audio cutting.
+
+    Validation normally applies ``confirmed_span`` already, but later pipeline
+    stages rebuild marker dicts and mutate boundaries. Re-assert the approved
+    span after every reviewer/tail operation and synchronize the master marker
+    so the rendered cut and UI audit trail cannot diverge.
+    """
+    if not ads_to_remove:
+        return ads_to_remove
+    corrections = (confirmed_corrections if confirmed_corrections is not None
+                   else db.get_confirmed_corrections(episode_id))
+    def matching_correction(marker):
+        for corr in corrections or []:
+            ratio = overlap_ratio(
+                corr['start'], corr['end'], marker['start'], marker['end'])
+            if ratio >= CORRECTION_MATCH_MIN_COVERAGE:
+                return corr
+        return None
+
+    def approved_span(marker):
+        validation = marker.get('validation') or {}
+        if not validation.get('user_confirmed'):
+            return None
+        carried = validation.get('confirmed_span')
+        if isinstance(carried, dict):
+            return carried
+        correction = matching_correction(marker)
+        if correction is None:
+            return None
+        return correction.get('confirmed_span')
+
+    def apply_span(marker, approved):
+        target_start = max(0.0, float(approved['start']))
+        target_end = float(approved['end'])
+        if episode_duration is not None and episode_duration > 0:
+            target_end = min(target_end, float(episode_duration))
+        if target_end <= target_start:
+            return False
+        old_start, old_end = marker['start'], marker['end']
+        missing = object()
+        old_metadata = (
+            marker.get('end_extended_by_content', missing),
+            marker.get('tail_splice_snap', missing),
+            marker.get('dai_core_spans', missing),
+        )
+        # Final human authority supersedes how an automatic tail happened to
+        # reach even the same edge; do not let that stale provenance enable a
+        # later expansion on reload.
+        marker.pop('end_extended_by_content', None)
+        marker.pop('tail_splice_snap', None)
+        marker['start'], marker['end'] = target_start, target_end
+        clip_dai_core_spans(marker, target_start, target_end)
+        flags = (marker.get('validation') or {}).get('flags')
+        note_added = False
+        if isinstance(flags, list):
+            note = 'INFO: Finalized to user-approved span'
+            if note not in flags:
+                flags.append(note)
+                note_added = True
+        new_metadata = (
+            marker.get('end_extended_by_content', missing),
+            marker.get('tail_splice_snap', missing),
+            marker.get('dai_core_spans', missing),
+        )
+        return (
+            (old_start, old_end) != (target_start, target_end)
+            or old_metadata != new_metadata
+            or note_added
+        )
+
+    changed = False
+    for ad in ads_to_remove:
+        approved = approved_span(ad)
+        if approved is None:
+            continue
+        # Resolve the master before changing the cut-list key. A separate copy
+        # may already have drifted, so fall back to the same carried approval.
+        master = _find_master(all_ads_with_validation, ad)
+        if master is None:
+            master = next((
+                candidate for candidate in all_ads_with_validation
+                if approved_span(candidate) == approved
+                and ranges_overlap(
+                    candidate['start'], candidate['end'],
+                    ad['start'], ad['end'])
+            ), None)
+        changed = apply_span(ad, approved) or changed
+        if master is not None and master is not ad:
+            changed = apply_span(master, approved) or changed
+
+    if changed:
+        storage.save_combined_ads(slug, episode_id, all_ads_with_validation)
+    return ads_to_remove
 
 
 def _apply_pass2_heuristic_rolls(slug, episode_id, verification_ads_processed,
@@ -3219,7 +3391,7 @@ def _apply_boundary_adjustments(slug, episode_id, all_ads):
     corrections = db.get_episode_corrections(episode_id) or []
     adjusted = set()
     applied = 0
-    for c in corrections:  # newest first (ORDER BY created_at DESC)
+    for c in corrections:  # newest first (ORDER BY id DESC)
         if c.get('correction_type') != 'boundary_adjustment':
             continue
         orig = c.get('original_bounds') or {}
@@ -3236,6 +3408,10 @@ def _apply_boundary_adjustments(slug, episode_id, all_ads):
             )
             continue
         match['start'], match['end'] = n_start, n_end
+        # Boundary adjustments are explicit user edits. Keep measured DAI
+        # evidence inside the approved range so validation cannot restore a
+        # stale automatic boundary over audio the user chose to preserve.
+        clip_dai_core_spans(match, n_start, n_end)
         adjusted.add(id(match))
         applied += 1
     if applied:
@@ -4163,6 +4339,21 @@ def process_episode(slug: str, episode_id: str, episode_url: str,
                 slug, episode_id, ads_to_remove, all_ads_with_validation,
                 segments, podcast_name=podcast_name
             )
+
+            # A transcript-guided tail extension can stop before an
+            # untranscribed sonic logo. Strong forward splice evidence closes
+            # that final gap without crossing speech or another marker.
+            ads_to_remove = _snap_completed_cut_tails_to_splice(
+                slug, episode_id, ads_to_remove, all_ads_with_validation,
+                segments, audio_analysis_result, podcast_name=podcast_name
+            )
+
+            # Human-approved trim bounds are the final boundary authority.
+            # Run after every automated reviewer and tail mutation so neither
+            # the audio cut nor its persisted marker can drift from approval.
+            ads_to_remove = _finalize_user_confirmed_bounds(
+                slug, episode_id, ads_to_remove, all_ads_with_validation,
+                episode_duration=episode_duration)
 
             # Backstop: the late keep partition above should already have
             # caught everything, so this normally finds nothing.
