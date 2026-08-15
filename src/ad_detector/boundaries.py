@@ -1249,6 +1249,7 @@ def snap_terminal_ad_to_splice(ads: List[Dict], segments: List[Dict],
                                episode_duration: float,
                                window_s: float,
                                coverage_ads: Optional[List[Dict]] = None,
+                               blocking_ads: Optional[List[Dict]] = None,
                                eof_tolerance_s: float = TERMINAL_SNAP_EOF_TOLERANCE_SECONDS,
                                podcast_name: str = None) -> List[Dict]:
     """Snap a terminal ad's start back to the strongest deep-silence splice.
@@ -1289,6 +1290,13 @@ def snap_terminal_ad_to_splice(ads: List[Dict], segments: List[Dict],
             ad_sponsors = extract_sponsor_names(
                 ad_text, ad_copy.get('reason'), exclude=own_site)
             for event in candidates:
+                if any(
+                        blocker.get('start') is not None
+                        and blocker.get('end') is not None
+                        and blocker['start'] < ad_copy['start']
+                        and blocker['end'] > event['time']
+                        for blocker in (blocking_ads or [])):
+                    continue
                 if _span_blocked_by_content(segments, coverage, ad_sponsors,
                                             event['time'], ad_copy['start']):
                     continue
