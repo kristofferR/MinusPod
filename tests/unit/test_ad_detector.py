@@ -622,6 +622,122 @@ class TestSplitConflictingActionSpan:
         assert entries[0]['start'] == 25.0
         assert entries[0]['end'] == 30.0
 
+    def test_later_keep_owns_partial_overlap_with_remove(self):
+        last = {'start': 100.0, 'end': 150.0, 'category': 'sponsor'}
+        current = {'start': 130.0, 'end': 170.0, 'category': 'self_promo'}
+
+        new_last, entries = split_conflicting_action_span(
+            last, current, 'remove', 'keep')
+
+        assert new_last['start'] == 100.0
+        assert new_last['end'] == 130.0
+        assert entries == [current]
+
+    def test_later_remove_yields_partial_overlap_to_keep(self):
+        last = {'start': 100.0, 'end': 150.0, 'category': 'self_promo'}
+        current = {'start': 130.0, 'end': 170.0, 'category': 'sponsor'}
+
+        new_last, entries = split_conflicting_action_span(
+            last, current, 'keep', 'remove')
+
+        assert new_last == last
+        assert entries[0]['start'] == 150.0
+        assert entries[0]['end'] == 170.0
+
+    def test_nested_keep_split_marks_short_remove_fragments_trusted(self):
+        last = {
+            'start': 100.0, 'end': 126.0, 'category': 'sponsor',
+            'confidence': 0.85,
+        }
+        current = {
+            'start': 108.0, 'end': 118.0, 'category': 'self_promo',
+        }
+
+        new_last, entries = split_conflicting_action_span(
+            last, current, 'remove', 'keep')
+
+        assert (new_last['start'], new_last['end']) == (100.0, 108.0)
+        assert (entries[1]['start'], entries[1]['end']) == (118.0, 126.0)
+        assert new_last['_trusted_split_fragment'] is True
+        assert entries[1]['_trusted_split_fragment'] is True
+
+    def test_later_keep_owns_overlap_with_defined_remove_pattern(self):
+        last = {
+            'start': 100.0, 'end': 150.0, 'category': 'sponsor',
+            'pattern_defined': True,
+        }
+        current = {
+            'start': 130.0, 'end': 170.0, 'category': 'self_promo',
+        }
+
+        new_last, entries = split_conflicting_action_span(
+            last, current, 'remove', 'keep')
+
+        assert new_last['end'] == 130.0
+        assert entries == [current]
+
+    def test_keep_owns_overlap_with_later_defined_remove_pattern(self):
+        last = {
+            'start': 100.0, 'end': 150.0, 'category': 'self_promo',
+        }
+        current = {
+            'start': 130.0, 'end': 170.0, 'category': 'sponsor',
+            'pattern_defined': True,
+        }
+
+        new_last, entries = split_conflicting_action_span(
+            last, current, 'keep', 'remove')
+
+        assert new_last == last
+        assert entries[0]['start'] == 150.0
+        assert entries[0]['end'] == 170.0
+
+    def test_keep_owns_overlap_with_later_defined_beep_pattern(self):
+        last = {
+            'start': 100.0, 'end': 150.0, 'category': 'self_promo',
+        }
+        current = {
+            'start': 130.0, 'end': 170.0, 'category': 'outro',
+            'pattern_defined': True,
+        }
+
+        new_last, entries = split_conflicting_action_span(
+            last, current, 'keep', 'beep')
+
+        assert new_last == last
+        assert entries[0]['start'] == 150.0
+        assert entries[0]['end'] == 170.0
+
+    def test_defined_pattern_yields_overlap_to_beep(self):
+        last = {
+            'start': 100.0, 'end': 150.0, 'category': 'sponsor',
+            'pattern_defined': True,
+        }
+        current = {
+            'start': 130.0, 'end': 170.0, 'category': 'self_promo',
+        }
+
+        new_last, entries = split_conflicting_action_span(
+            last, current, 'remove', 'beep')
+
+        assert new_last['end'] == 130.0
+        assert entries == [current]
+
+    def test_defined_keep_pattern_yields_overlap_to_beep(self):
+        last = {
+            'start': 100.0, 'end': 150.0, 'category': 'self_promo',
+            'pattern_defined': True,
+        }
+        current = {
+            'start': 130.0, 'end': 170.0, 'category': 'sponsor',
+        }
+
+        new_last, entries = split_conflicting_action_span(
+            last, current, 'keep', 'beep')
+
+        assert new_last['end'] == 130.0
+        assert entries == [current]
+
     def test_current_nested_inside_last_splits_last_around_it(self):
         """The DTNS 5317 shape: a longer remove-resolving pattern match
         fully containing a shorter keep-resolving LLM span (e.g. an intro

@@ -16,6 +16,7 @@ import pytest
 from tests.app_bootstrap import bootstrap
 
 _test_data_dir = bootstrap('validate_vads_test_')
+from audio_processor import AudioProcessor
 from main_app.processing import (
     _drop_uncovered_pass2_ads,
     _gate_verification_ads_by_confidence,
@@ -74,6 +75,29 @@ def test_merge_keeps_correct_twin_for_later_ad():
     # The far ad pairs with its own original, not B's.
     assert kept_proc[1]['start'] == 400.0
     assert kept_orig[1]['marker'] == 'C'
+
+
+def test_merge_preserves_later_trusted_split_fragment():
+    processed = [
+        {'start': 100.0, 'end': 102.0, 'confidence': 0.85},
+        {'start': 106.0, 'end': 108.0, 'confidence': 0.85,
+         '_trusted_split_fragment': True},
+    ]
+    original = [
+        {'start': 1100.0, 'end': 1102.0},
+        {'start': 1106.0, 'end': 1108.0},
+    ]
+
+    kept_proc, kept_orig = _run(processed, original)
+
+    assert kept_proc[0]['_trusted_split_fragment'] is True
+    assert kept_orig[0] == {
+        'start': 1100.0,
+        'end': 1108.0,
+        '_trusted_split_fragment': True,
+    }
+    applied = AudioProcessor().compute_applied_cuts(kept_proc, 600.0)
+    assert [(cut['start'], cut['end']) for cut in applied] == [(100.0, 108.0)]
 
 
 def test_unsorted_input_pairs_by_identity_not_position():
@@ -892,6 +916,26 @@ def test_drop_uncovered_handles_twinless_cut():
 
     assert v_ads_to_cut == [covered]
     assert filtered['was_cut'] is False
+
+
+def test_drop_uncovered_removes_split_cut_ui_twin():
+    covered = {'start': 100.0, 'end': 130.0}
+    filtered = {'start': 150.0, 'end': 155.0}
+    covered_ui = {'start': 1100.0, 'end': 1130.0}
+    filtered_ui = {'start': 1150.0, 'end': 1155.0}
+    v_ads_to_cut = [covered, filtered]
+    v_ads_for_ui = [covered_ui, filtered_ui]
+
+    _drop_uncovered_pass2_ads(
+        's', 'e', v_ads_to_cut, v_ads_for_ui,
+        [{'start': 100.0, 'end': 130.0}], [], [],
+        total_duration=600.0,
+    )
+
+    assert v_ads_to_cut == [covered]
+    assert v_ads_for_ui == [covered_ui]
+    assert filtered['was_cut'] is False
+    assert filtered_ui['was_cut'] is False
 
 
 def test_filing_respects_human_reject(monkeypatch):

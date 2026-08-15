@@ -26,6 +26,7 @@ from config import (
     MIN_KEYWORD_LENGTH, MIN_UNCOVERED_TAIL_DURATION,
     TERMINAL_SNAP_EOF_TOLERANCE_SECONDS,
     DEFAULT_SEGMENT_ACTION, normalize_segment_category,
+    MIN_AD_DURATION_FOR_REMOVAL,
     PATTERN_TIGHTEN_MIN_EXCESS_SECONDS, PATTERN_TIGHTEN_MIN_CONFIDENCE,
 )
 
@@ -1089,7 +1090,9 @@ def resolve_category_action(category, action_map: Dict[str, str]) -> str:
     return action_map.get(normalize_segment_category(category), DEFAULT_SEGMENT_ACTION)
 
 
-def split_conflicting_action_span(last: Dict, current: Dict) -> tuple:
+def split_conflicting_action_span(last: Dict, current: Dict,
+                                  last_action: str = None,
+                                  current_action: str = None) -> tuple:
     """Resolve two adjacent-or-overlapping ads whose resolved actions differ:
     never merge a keep-resolving detection into a remove-resolving one, and
     never let a span fully nested inside the other collapse to nothing.
@@ -1099,13 +1102,55 @@ def split_conflicting_action_span(last: Dict, current: Dict) -> tuple:
     consumed) replaces ``last``.
 
     - No true overlap: both survive untouched.
-    - ``current`` fully nested in ``last``: split ``last`` around it so both
-      pieces and the nested span survive.
-    - ``current`` extends past ``last``'s end: clamp its start forward past
-      ``last``'s end so the two spans never double-cut the same audio.
+    When actions are supplied, precedence is keep > beep > remove. The
+    higher-priority action owns contested audio; without actions, preserve
+    the historical behavior where ``current`` owns it.
     """
     if current['start'] >= last['end']:
         return last, [current.copy()]
+
+    def mark_trusted_fragment(fragment, parent):
+        if (parent.get('_trusted_split_fragment')
+                or parent['end'] - parent['start']
+                >= MIN_AD_DURATION_FOR_REMOVAL):
+            fragment['_trusted_split_fragment'] = True
+        return fragment
+
+    priority = {'remove': 0, 'beep': 1, 'keep': 2}
+    last_pattern = bool(last.get('pattern_defined'))
+    current_pattern = bool(current.get('pattern_defined'))
+    effective_last_action = (
+        'remove' if last_pattern and last_action == 'keep' else last_action)
+    effective_current_action = (
+        'remove' if current_pattern and current_action == 'keep'
+        else current_action)
+    if ((last_action is None or current_action is None)
+            and current['end'] > last['end']):
+        # Legacy no-action behavior: the earlier marker owns a partial
+        # overlap. Action-aware callers use explicit precedence below.
+        clamped = current.copy()
+        for key in ('merged_distinct_ads', 'merged_protected_start',
+                    'merged_protected_end'):
+            clamped.pop(key, None)
+        clamped['start'] = last['end']
+        mark_trusted_fragment(clamped, current)
+        return last, [clamped]
+    current_wins = (
+        effective_last_action is None
+        or effective_current_action is None
+        or (priority.get(effective_current_action, 0)
+            >= priority.get(effective_last_action, 0))
+    )
+    if not current_wins:
+        if current['end'] <= last['end']:
+            return last, []
+        after = current.copy()
+        for key in ('merged_distinct_ads', 'merged_protected_start',
+                    'merged_protected_end'):
+            after.pop(key, None)
+        after['start'] = last['end']
+        mark_trusted_fragment(after, current)
+        return last, [after]
 
     if current['end'] <= last['end']:
         # Splitting last invalidates any merged_distinct_ads/
@@ -1121,15 +1166,23 @@ def split_conflicting_action_span(last: Dict, current: Dict) -> tuple:
         after = dict(before)
         after['start'] = current['end']
         after['end'] = last['end']
+        mark_trusted_fragment(before, last)
+        mark_trusted_fragment(after, last)
         new_last = before if before['start'] < before['end'] else None
         entries = [current.copy()]
         if after['start'] < after['end']:
             entries.append(after)
         return new_last, entries
 
-    clamped = current.copy()
-    clamped['start'] = last['end']
-    return last, [clamped]
+    shortened_last = last.copy()
+    for key in ('merged_distinct_ads', 'merged_protected_start',
+                'merged_protected_end'):
+        shortened_last.pop(key, None)
+    shortened_last['end'] = current['start']
+    mark_trusted_fragment(shortened_last, last)
+    if shortened_last['end'] <= shortened_last['start']:
+        shortened_last = None
+    return shortened_last, [current.copy()]
 
 
 def deduplicate_window_ads(all_ads: List[Dict], merge_threshold: float = 5.0,
@@ -1166,13 +1219,15 @@ def deduplicate_window_ads(all_ads: List[Dict], merge_threshold: float = 5.0,
 
         # Check for overlap (ads within threshold seconds are considered overlapping)
         if current['start'] <= last['end'] + merge_threshold:
+            last_action = (resolve_category_action(
+                last.get('category'), action_map) if action_map else None)
+            current_action = (resolve_category_action(
+                current.get('category'), action_map) if action_map else None)
             same_action = (
-                action_map is None
-                or resolve_category_action(last.get('category'), action_map)
-                   == resolve_category_action(current.get('category'), action_map)
-            )
+                action_map is None or last_action == current_action)
             if not same_action:
-                new_last, new_entries = split_conflicting_action_span(last, current)
+                new_last, new_entries = split_conflicting_action_span(
+                    last, current, last_action, current_action)
                 if new_last is None:
                     merged.pop()
                 else:

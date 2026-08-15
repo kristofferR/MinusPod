@@ -25,6 +25,7 @@ from unittest.mock import patch
 
 import main_app.processing as processing
 from api.patterns import _matches_held_marker
+from audio_processor import AudioProcessor
 from config import count_pending_review, HOLD_REASON_VERIFICATION_KEPT_CONFLICT
 
 SEGMENTS = [{'start': 0.0, 'end': 5.0, 'text': 'hello'},
@@ -706,9 +707,11 @@ class TestPartitionPass2CategoryActions:
         assert [(ad['start'], ad['end']) for ad in out_p] == [
             (100.0, 130.0), (150.0, 180.0),
         ]
+        assert all(ad['_trusted_split_fragment'] is True for ad in out_p)
         assert [(ad['start'], ad['end']) for ad in out_o] == [
             (119.0, 149.0), (169.0, 199.0),
         ]
+        assert all(ad['_trusted_split_fragment'] is True for ad in out_o)
         assert all(ad['reason'] == 'heuristic roll' for ad in out_p + out_o)
 
     def test_kept_audio_covering_candidate_drops_it(self):
@@ -736,6 +739,69 @@ class TestPartitionPass2CategoryActions:
         ]
         assert barriers[1] is pass2_keep
         assert (pass1_keep['start'], pass1_keep['end']) == (100.0, 120.0)
+
+    def test_remove_candidate_splits_around_beep_candidate(self):
+        remove_processed = {
+            'start': 100.0, 'end': 180.0, 'action_applied': 'remove',
+        }
+        remove_original = {
+            'start': 119.0, 'end': 199.0, 'action_applied': 'remove',
+        }
+        beep_processed = {
+            'start': 130.0, 'end': 150.0, 'action_applied': 'beep',
+        }
+        beep_original = {
+            'start': 149.0, 'end': 169.0, 'action_applied': 'beep',
+        }
+        pass1_cuts = [
+            {'start': 50.0, 'end': 70.0, 'replacement_duration': 1.0},
+        ]
+
+        out_p, out_o = processing._reconcile_pass2_cut_actions(
+            [remove_processed, beep_processed],
+            [remove_original, beep_original],
+            pass1_cuts,
+        )
+
+        assert [(ad['start'], ad['end'], ad['action_applied'])
+                for ad in out_p] == [
+            (100.0, 130.0, 'remove'),
+            (130.0, 150.0, 'beep'),
+            (150.0, 180.0, 'remove'),
+        ]
+        assert [(ad['start'], ad['end'], ad['action_applied'])
+                for ad in out_o] == [
+            (119.0, 149.0, 'remove'),
+            (149.0, 169.0, 'beep'),
+            (169.0, 199.0, 'remove'),
+        ]
+
+    def test_short_beep_barrier_stays_eligible_for_recut(self):
+        remove_processed = {
+            'start': 100.0, 'end': 130.0, 'action_applied': 'remove',
+        }
+        remove_original = {
+            'start': 100.0, 'end': 130.0, 'action_applied': 'remove',
+        }
+        beep_processed = {
+            'start': 110.0, 'end': 118.0, 'action_applied': 'beep',
+            'confidence': 0.85,
+        }
+        beep_original = dict(beep_processed)
+
+        out_p, out_o = processing._reconcile_pass2_cut_actions(
+            [remove_processed, beep_processed],
+            [remove_original, beep_original], [],
+        )
+
+        short_beep = next(ad for ad in out_p if ad['action_applied'] == 'beep')
+        assert short_beep['_trusted_split_fragment'] is True
+        applied = AudioProcessor().compute_applied_cuts(
+            [dict(short_beep, beep=True)], 200.0)
+        assert [(ad['start'], ad['end'], ad['replacement_duration'])
+                for ad in applied] == [(110.0, 118.0, 8.0)]
+        assert next(ad for ad in out_o if ad['action_applied'] == 'beep')[
+            '_trusted_split_fragment'] is True
 
     def test_run_verification_persists_keep_without_recut(self):
         ctx = types.SimpleNamespace(

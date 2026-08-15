@@ -188,7 +188,8 @@ class VerificationPass:
                 f"confidence={ad.get('confidence', 'N/A')}"
             )
 
-        # Feed missed ads back to pattern service for learning
+        # Match first-pass learning: a kept marker still represents a real ad
+        # read and remains eligible for pattern learning.
         if self.pattern_service and original_ads:
             try:
                 self.pattern_service.record_verification_misses(
