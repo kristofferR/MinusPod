@@ -2591,6 +2591,19 @@ def _run_verification_pass(ctx, processed_path, pass1_cuts,
                 f"{len(category_kept)} segment(s) by category action"
             )
 
+            # Heuristic rolls were added before category partitioning. A
+            # broader roll can therefore still overlap a category-kept marker
+            # after that marker is removed from the candidate lists.
+            (verification_ads_processed,
+             verification_ads_original,
+             category_keep_conflicts) = _exclude_kept_spans_from_verification(
+                verification_ads_processed,
+                verification_ads_original,
+                category_kept,
+                pass1_cuts,
+            )
+            v_ads_held.extend(category_keep_conflicts)
+
         had_verification_candidates = bool(verification_ads_processed)
         if verification_ads_processed:
             audio_logger.info(f"[{slug}:{episode_id}] Verification found {len(verification_ads_processed)} missed ads")
