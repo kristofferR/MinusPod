@@ -383,6 +383,15 @@ class AdValidator:
         # _orig_twin reference that must survive into the validated output.
         ads = [ad.copy() for ad in ads]
 
+        # Human false-positive decisions apply to the detected span the user
+        # actually reviewed. Preserve that match before measured DAI bounds
+        # restore portions removed by an automatic snap. Keep matching and
+        # non-matching markers separate so a nearby real ad is not rejected
+        # as collateral damage during the tiny-gap merge below.
+        for ad in ads:
+            ad['_matches_false_positive_correction'] = (
+                self._overlaps_false_positive(ad['start'], ad['end']))
+
         # Step 1: Auto-correct boundaries
         ads = self._clamp_boundaries(ads, result)
 
@@ -445,8 +454,13 @@ class AdValidator:
         duration = ad['end'] - ad['start']
         position = ad['start'] / self.episode_duration if self.episode_duration > 0 else 0
 
-        # Check for user-marked false positives first (highest priority)
-        if self._overlaps_false_positive(ad['start'], ad['end']):
+        # Check for user-marked false positives first (highest priority).
+        # The internal flag records a match before DAI-core restoration; pop
+        # it so validation-only bookkeeping is never persisted or returned.
+        matched_false_positive = ad.pop(
+            '_matches_false_positive_correction', False)
+        if (matched_false_positive
+                or self._overlaps_false_positive(ad['start'], ad['end'])):
             flags.append("INFO: User marked as false positive")
             logger.info(
                 f"Auto-rejecting segment {ad['start']:.1f}s-{ad['end']:.1f}s: "
@@ -1062,7 +1076,9 @@ class AdValidator:
             if (bool(last.get('differential_uncorroborated'))
                     != bool(current.get('differential_uncorroborated'))
                     or bool(last.get('held_for_review'))
-                    != bool(current.get('held_for_review'))):
+                    != bool(current.get('held_for_review'))
+                    or bool(last.get('_matches_false_positive_correction'))
+                    != bool(current.get('_matches_false_positive_correction'))):
                 merged.append(current.copy())
                 continue
 
