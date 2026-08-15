@@ -2104,8 +2104,10 @@ def _exclude_kept_spans_from_verification(verification_ads_processed,
     disagreement, so each one is stamped held_for_review and returned
     separately for the pending-review queue.
 
-    Runs before _gate_verification_ads_by_confidence so none of its
-    autocut/hold/log branches ever see a finding inside a kept span.
+    Runs before and after validation, both before
+    _gate_verification_ads_by_confidence, so none of its autocut/hold/log
+    branches ever see a finding inside a kept span. The second check matters
+    because validation can merge or extend a candidate across that span.
     pass1_kept_markers (original coordinates) are mapped onto the processed
     timeline via adjust_timestamp with pass1_cuts, matching the coordinate
     space of verification_ads_processed.
@@ -2612,6 +2614,20 @@ def _run_verification_pass(ctx, processed_path, pass1_cuts,
                     podcast_id=ctx.podcast_id,
                     segment_actions=segment_actions,
                 )
+
+                # Validation can merge close markers or extend a trailing
+                # marker. Recheck the resulting spans before anything reaches
+                # the gate, so those mutations cannot cut through a pass-1
+                # keep that the pre-validation check did not overlap.
+                (verification_ads_processed,
+                 verification_ads_original,
+                 validated_kept_conflicts) = _exclude_kept_spans_from_verification(
+                    verification_ads_processed,
+                    verification_ads_original,
+                    pass1_kept_markers,
+                    pass1_cuts,
+                )
+                kept_conflicts.extend(validated_kept_conflicts)
 
             if verification_ads_processed:
                 # Confidence gate and re-cut

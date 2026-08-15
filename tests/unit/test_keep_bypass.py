@@ -767,6 +767,56 @@ class TestPartitionPass2CategoryActions:
         assert original['hold_reason'] == 'verification_kept_conflict'
         assert 'action_applied' not in original
 
+    def test_validation_expansion_into_pass1_keep_is_diverted_before_gate(self):
+        """A pass-2 span can cross a keep only after validation extends it."""
+        ctx = types.SimpleNamespace(
+            slug='pass2-actions', episode_id='ep1', podcast_id=1,
+            podcast_name='Test Show', episode_title='Episode',
+            episode_description=None, podcast_description=None,
+        )
+        candidate = {
+            'start': 100.0, 'end': 110.0, 'confidence': 0.95,
+            'category': 'sponsor',
+        }
+        original = dict(candidate)
+        validated_candidate = {**candidate, 'end': 120.0}
+        audio_processor = types.SimpleNamespace(
+            get_audio_duration=lambda _path: 200.0)
+
+        with ExitStack() as stack:
+            db = stack.enter_context(patch.object(processing, 'db'))
+            stack.enter_context(patch.object(processing, 'storage'))
+            stack.enter_context(patch.object(
+                processing, '_apply_pass2_heuristic_rolls'))
+            stack.enter_context(patch.object(
+                processing, '_validate_verification_ads',
+                return_value=([validated_candidate], [original])))
+            verifier_cls = stack.enter_context(
+                patch('verification_pass.VerificationPass'))
+            verifier_cls.return_value.verify.return_value = {
+                'ads': [original],
+                'ads_processed': [candidate],
+                'segments': SEGMENTS,
+                'status': 'success',
+            }
+            db.get_setting_float.return_value = 0.6
+
+            result = processing._run_verification_pass(
+                ctx, '/tmp/pass2-actions.mp3', [], False, 0.8,
+                audio_processor, None,
+                pass1_kept_markers=[{
+                    'start': 115.0, 'end': 125.0,
+                    'action_applied': 'keep',
+                }],
+                segment_actions=self.ACTIONS,
+            )
+
+        assert result[0] == 0
+        assert result[1] == []
+        assert result[3] == [original]
+        assert original['held_for_review'] is True
+        assert original['hold_reason'] == 'verification_kept_conflict'
+
 
 def test_dedupe_pass2_markers_collapses_repeats():
     """The merge concatenates the UI and held lists, so a marker reaching both
